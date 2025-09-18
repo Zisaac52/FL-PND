@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE/Editor specific
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Datasets - VERY IMPORTANT!
+# Do not commit large dataset files to the repository.
+Panax notoginseng disease dataset/
+data/
+
+# Ray and Flower logs/artifacts
+ray_results/
+.ray/
+*.ray/
+.flwr/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
