@@ -45,7 +45,7 @@ class PND_Segmentation_Dataset(Dataset):
 
 # --- 自定义数据变换 ---
 class SegmentationTransforms:
-    def __init__(self, size=(256, 256), is_train=True):
+    def __init__(self, size=(512, 512), is_train=True):
         self.size = size
         self.is_train = is_train
         self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])

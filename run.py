@@ -56,7 +56,12 @@ if __name__ == "__main__":
         root_dir='./Panax notoginseng disease dataset/VOC2007', 
         image_set='train'
     )
-    num_classes = get_net().classifier[4].out_channels
+    # num_classes = get_net().classifier[4].out_channels
+    # SMP U-Net's output layer is called 'segmentation_head'
+    temp_net = get_net()
+    num_classes = temp_net.segmentation_head[0].out_channels
+    del temp_net # Free up memory
+    
     class_weights = calculate_class_weights(full_train_dataset, num_classes)
 
     # 3. 准备客户端工厂函数 (client_fn)，注入所有资源
@@ -68,7 +73,7 @@ if __name__ == "__main__":
 
     # 4. 获取服务器组件 (Strategy 和 ServerConfig)
     #    在这里设置您想要的训练轮数
-    server_components = get_server_components(num_rounds=20)
+    server_components = get_server_components(num_rounds=50)
 
     # 5. 定义客户端所需的计算资源
     client_resources = {"num_cpus": 2, "num_gpus": 0.5}

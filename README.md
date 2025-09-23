@@ -1,19 +1,21 @@
 # Federated Learning for Panax Notoginseng Disease Segmentation
 
-This project implements a federated learning system for segmenting diseases on Panax Notoginseng (三七) leaves. It is built using the [Flower](https://flower.ai/) framework and leverages a pre-trained DeepLabV3+ model with a ResNet-50 backbone for semantic segmentation.
+This project implements a federated learning system for segmenting diseases on Panax Notoginseng (三七) leaves. It is built using the [Flower](https://flower.ai/) framework and achieves high performance by fine-tuning a **U-Net** model with a pre-trained ResNet-50 backbone.
 
 The system is designed to handle the significant class imbalance present in the dataset (large background areas vs. small disease regions) and uses a robust evaluation setup with a global validation set.
 
   
-## Key Features
+## Key Features & Optimizations
 
-- **Federated Learning**: Simulates a scenario where data from multiple clients (e.g., different farms or research labs) is used to train a global model without sharing the raw data, preserving privacy.
-- **Advanced Segmentation Model**: Utilizes a DeepLabV3+ model pre-trained on COCO, fine-tuned for the specific task of disease segmentation.
+- **High-Performance U-Net Architecture**: Employs a U-Net model, whose skip-connections are proven to be highly effective for tasks requiring precise localization and fine-grained boundary segmentation.
+- **Federated Averaging (FedAvg)**: Utilizes the foundational federated learning algorithm to collaboratively train a global model without sharing sensitive raw data.
+- **Two-Stage Fine-Tuning**: Implements a professional transfer learning strategy:
+  1.  **Stage 1**: The model's pre-trained encoder is frozen, and only the decoder is trained to rapidly adapt to the new task.
+  2.  **Stage 2**: The entire network is unfrozen and fine-tuned end-to-end with a very small learning rate for maximum performance.
 - **Class Imbalance Handling**:
-  - **Weighted Cross-Entropy Loss**: Applies calculated class weights to the loss function, giving higher importance to rare disease classes.
-  - **Background Class Ignored**: Both training and evaluation metrics (mIoU) focus solely on the performance of foreground (disease) classes.
-- **Robust Evaluation**: Uses a dedicated, global validation set for all clients to ensure fair and consistent model evaluation across federated rounds.
-- **GPU Accelerated**: The simulation is configured to run on NVIDIA GPUs for efficient training, managed by a custom Python script that controls the Ray backend.
+  - **Weighted Cross-Entropy Loss**: Applies pre-calculated class weights to counteract the dominance of the background class.
+  - **Foreground-Focused Metrics**: Both the loss function and evaluation metrics (mIoU, Pixel Accuracy) ignore the background class to provide a true measure of disease segmentation performance.
+- **GPU Accelerated Simulation**: Launched via a custom Python script that provides full control over the Ray backend, ensuring efficient GPU utilization.
 
 ## Project Structure
 
@@ -47,6 +49,7 @@ PND/
 1.  **Clone the repository:**
     ```bash
     git clone https://github.com/Zisaac52/FL-PND.git
+    cd FL-PND
     ```
 
 2.  **Download the Dataset:**
