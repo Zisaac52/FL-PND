@@ -73,7 +73,7 @@ if __name__ == "__main__":
 
     # 4. 获取服务器组件 (Strategy 和 ServerConfig)
     #    在这里设置您想要的训练轮数
-    server_components = get_server_components(num_rounds=50)
+    server_components = get_server_components(num_rounds=100)
 
     # 5. 定义客户端所需的计算资源
     client_resources = {"num_cpus": 2, "num_gpus": 0.5}

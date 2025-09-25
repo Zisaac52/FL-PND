@@ -27,6 +27,7 @@ ray_results/
 .ray/
 *.ray/
 .flwr/
+logs/
 
 # Build artifacts
 build/
