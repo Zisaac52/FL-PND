@@ -21,6 +21,8 @@ dependencies = [
     "datasets>=2.16.0",          # Hugging Face Datasets library
     "tqdm>=4.62.3",              # Progress bar library used in task.py
     "Pillow>=9.0.0",             # Image processing library used in dataset.py
+    "segmentation-models-pytorch>=0.3.3", # For U-Net model
+    "web3>=6.0.0",                       # <-- [新增] For Blockchain interaction
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -29,7 +29,24 @@ ray_results/
 .flwr/
 logs/
 
-# Build artifacts
+# Python Build artifacts
 build/
 dist/
 *.egg-info/
+
+# --- NodeJS / Hardhat ---
+# Dependencies
+node_modules/
+
+# Build artifacts and cache
+artifacts/
+cache/
+ignition/deployments/
+ignition/journa.log
+types/
+
+# Log files
+*.log
+
+# Environment variables
+.env
