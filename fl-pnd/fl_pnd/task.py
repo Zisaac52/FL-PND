@@ -400,7 +400,7 @@ def train(
             # SMP 模型直接返回张量
             outputs = net(images)
             
-             # --- [核心修改] 实现我们自己的混合损失函数 ---
+            # --- [核心修改] 实现我们自己的混合损失函数 ---
             
             # 1. 对模型输出应用 LogSoftmax
             log_probs = torch.nn.functional.log_softmax(outputs, dim=1)

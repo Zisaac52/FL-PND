@@ -50,3 +50,6 @@ types/
 
 # Environment variables
 .env
+
+# Ignore auto-generated contract artifacts copied to the Python project
+fl-pnd/fl_pnd/contracts/
