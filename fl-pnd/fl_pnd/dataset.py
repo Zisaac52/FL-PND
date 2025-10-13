@@ -67,7 +67,7 @@ class SegmentationTransforms:
 # --- Hugging Face & Partitioner 逻辑 (用于训练集) ---
 def load_data(num_partitions: int):
     """加载训练集、转换为HF格式并创建Partitioner。"""
-    DATASET_ROOT = './Panax notoginseng disease dataset/VOC2007'
+    DATASET_ROOT = '/root/PND/Panax notoginseng disease dataset/VOC2007'
     full_train_dataset = PND_Segmentation_Dataset(root_dir=DATASET_ROOT, image_set='train', transforms=None)
 
     dataset_dict = {"image": [img for img, _ in full_train_dataset], "mask": [mask for _, mask in full_train_dataset]}
@@ -101,7 +101,7 @@ def get_dataloader(partition, batch_size: int, is_train: bool):
 # --- [新增] 全局验证集加载器 ---
 def get_val_dataloader(batch_size: int):
     """创建一个全局的验证集 DataLoader。"""
-    DATASET_ROOT = './Panax notoginseng disease dataset/VOC2007'
+    DATASET_ROOT = '/root/PND/Panax notoginseng disease dataset/VOC2007'
     
     # 1. 创建一个 PyTorch Dataset，专门加载验证集
     transforms = SegmentationTransforms(is_train=False)
