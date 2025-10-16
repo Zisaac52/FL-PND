@@ -13,12 +13,10 @@ class UpperChainBlock:
     client_id: str
     dataset_size: int
     model_params: ModelParameters
-    parent_upper_hash: str
     parent_lower_hash: str
     
     # --- 有默认值的字段 ---
     metrics: Dict[str, float] = field(default_factory=dict)
-    nonce: int = 0
     hash: str = ""
 
     def _get_hashable_string(self) -> str:
@@ -29,9 +27,7 @@ class UpperChainBlock:
         payload = {
             "client_id": self.client_id,
             "dataset_size": self.dataset_size,
-            "parent_upper_hash": self.parent_upper_hash,
-            "parent_lower_hash": self.parent_lower_hash,
-            "nonce": self.nonce
+            "parent_lower_hash": self.parent_lower_hash
         }
         return json.dumps(payload, sort_keys=True)
 

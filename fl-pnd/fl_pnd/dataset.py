@@ -96,7 +96,8 @@ def get_dataloader(partition, batch_size: int, is_train: bool):
         masks = torch.stack([item['mask'] for item in batch])
         return images, masks
         
-    return DataLoader(partition, batch_size=batch_size, shuffle=is_train, collate_fn=collate_fn)
+    # [核心修复] 强制 num_workers=0 以避免在子进程中出现死锁
+    return DataLoader(partition, batch_size=batch_size, shuffle=is_train, collate_fn=collate_fn, num_workers=0)
 
 # --- [新增] 全局验证集加载器 ---
 def get_val_dataloader(batch_size: int):
@@ -110,7 +111,8 @@ def get_val_dataloader(batch_size: int):
     print(f"全局验证集已加载，包含 {len(val_dataset)} 个样本。")
 
     # 2. 直接用 PyTorch DataLoader 包装
-    return DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    # [核心修复] 强制 num_workers=0 以避免在子进程中出现死锁
+    return DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
 # --- [新增] 类别权重计算函数 ---
 def calculate_class_weights(dataset: torch.utils.data.Dataset, num_classes: int) -> torch.Tensor:

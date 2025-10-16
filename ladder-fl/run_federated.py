@@ -1,10 +1,12 @@
 import random
 import time
 import numpy as np
+import torch
 import multiprocessing
 from multiprocessing import Pool
 from typing import List
 import copy
+import os
 
 from .network import Network
 from .federated_node import FederatedNode, test, DEVICE
@@ -18,67 +20,93 @@ from .serde import serializable_to_parameters, parameters_to_serializable
 
 def federated_average(updates: List[UpperChainBlock]) -> List[np.ndarray]:
     """
-    对来自多个客户端的模型更新执行联邦平均。
+    对来自多个客户端的模型更新执行联邦平均 (在GPU上执行以加速)。
     """
-    print("收敛节点: 正在执行真实的联邦平均...")
+    print("收敛节点: 正在执行真实的联邦平均 (GPU加速)...")
     
+    if not updates:
+        return []
+
     # 提取所有模型参数和数据集大小
-    all_params = [u.model_params for u in updates]
+    all_params_np = [u.model_params for u in updates]
     dataset_sizes = [u.dataset_size for u in updates]
     total_size = sum(dataset_sizes)
 
     # 初始化一个新的模型参数列表用于存放聚合结果
-    aggregated_params: List[np.ndarray] = []
+    aggregated_params_np: List[np.ndarray] = []
+
+    # 将权重转换为PyTorch张量
+    weights = torch.tensor(dataset_sizes, dtype=torch.float32, device=DEVICE) / total_size
 
     # 遍历模型中的每一层参数
-    for i in range(len(all_params[0])):
-        # 计算该层参数的加权平均
-        weighted_sum = sum(params[i] * size for params, size in zip(all_params, dataset_sizes))
-        aggregated_layer = weighted_sum / total_size
-        aggregated_params.append(aggregated_layer)
+    for i in range(len(all_params_np[0])):
+        # 将这一层所有客户端的参数收集起来，并转换为GPU上的张量
+        layer_params = [torch.from_numpy(params[i]).to(DEVICE) for params in all_params_np]
         
-    return aggregated_params
-
-# --- PoW 辅助函数 ---
-
-def perform_pow(block: UpperChainBlock, difficulty: int) -> UpperChainBlock:
-    """模拟工作量证明"""
-    prefix = "0" * difficulty
-    while not block.hash.startswith(prefix):
-        block.nonce += 1
-        block.hash = block.calculate_hash()
-    print(f"节点 {block.client_id}: PoW完成! Nonce={block.nonce}, Hash={block.hash[:8]}...")
-    return block
+        # 使用堆叠和加权求和来高效计算
+        stacked_params = torch.stack(layer_params, dim=0)
+        
+        # 调整权重张量的形状以进行广播
+        view_shape = (-1,) + (1,) * (stacked_params.dim() - 1)
+        weighted_sum = torch.sum(stacked_params * weights.view(view_shape), dim=0)
+        
+        aggregated_params_np.append(weighted_sum.cpu().numpy())
+        
+    return aggregated_params_np
 
 # --- 仿真主流程 ---
 
-def node_process(args):
-    """每个节点运行的独立进程，并返回结果"""
+# 全局工作节点缓存，用于在每个工作进程中保持状态
+worker_nodes_cache = {}
+
+def worker_process_stateful(args):
+    """
+    一个有状态的工作进程函数。它在第一次为一个给定的client_id调用时创建节点，
+    并在同一进程中的后续调用中重用它。
+    """
+    global worker_nodes_cache
     node_id, partition, valloader, class_weights, lower_block_dict, current_round = args
 
-    # 反序列化下链区块
+    # 检查此客户端ID的节点是否已在此工作进程中初始化
+    if node_id not in worker_nodes_cache:
+        print(f"工作进程 {os.getpid()}: 正在为 {node_id} 初始化新的FederatedNode...")
+        # 在一个新进程中，为此节点创建DataLoader
+        trainloader = get_dataloader(partition, batch_size=4, is_train=True)
+        # 创建并缓存节点。这是昂贵的部分（模型创建，GPU传输）
+        node = FederatedNode(
+            node_id=node_id,
+            network=None,
+            trainloader=trainloader,
+            valloader=valloader,
+            class_weights=class_weights
+        )
+        worker_nodes_cache[node_id] = node
+    else:
+        # 从缓存中重用现有节点
+        node = worker_nodes_cache[node_id]
+
+    # 反序列化下链区块以获取新的全局模型
     lower_block = LowerChainBlock(**lower_block_dict)
     lower_block.aggregated_global_model = serializable_to_parameters(lower_block.aggregated_global_model)
 
-    # 在子进程中创建DataLoader
-    trainloader = get_dataloader(partition, batch_size=4, is_train=True)
-
-    # [修改] 将 class_weights 传递给节点
-    node = FederatedNode(node_id=node_id, network=None, trainloader=trainloader, valloader=valloader, class_weights=class_weights)
+    # 设置模型参数并运行本地轮次
     node.set_model_parameters(lower_block.aggregated_global_model)
     metrics = node.run_local_round(current_round=current_round)
+    
+    # 获取损失和更新后的参数
+    loss, _ = test(net=node.model, testloader=node.valloader, device=DEVICE)
+    metrics['loss'] = loss
     updated_params = node.get_model_parameters()
     
+    # 创建并准备要返回的上链区块
     upper_block = UpperChainBlock(
         client_id=node.node_id,
         dataset_size=len(node.trainloader.dataset),
         model_params=updated_params,
         metrics=metrics,
-        parent_upper_hash="GENESIS_UPPER", # 简化处理
         parent_lower_hash=lower_block.hash
     )
     upper_block.hash = upper_block.calculate_hash()
-    upper_block = perform_pow(upper_block, difficulty=2)
     
     # 为了能跨进程返回，将区块对象转换为可序列化的字典
     block_dict = copy.deepcopy(upper_block).__dict__
@@ -90,8 +118,9 @@ def node_process(args):
 def run_federated_simulation():
     # ================== 可调整参数 ==================
     NUM_NODES = 10
-    NUM_ROUNDS = 5
+    NUM_ROUNDS = 3
     MAX_CONCURRENT_WORKERS = 4
+    EMA_ALPHA = 0.3 # 指数移动平均的alpha值
     # ==============================================
 
     print("--- 开始完整并行的真实LadderFL仿真 ---")
@@ -124,59 +153,99 @@ def run_federated_simulation():
         parent_lower_hash="NULL"
     )
     latest_lower_block.hash = latest_lower_block.calculate_hash()
+
+    # 3. 初始化信誉账本
+    reputation_ledger = {f"client_{i}": 1.0 / NUM_NODES for i in range(NUM_NODES)}
+    print(f"\n--- 初始信誉分布 ---")
+    for cid, rep in reputation_ledger.items():
+        print(f"  - {cid}: {rep:.4f}")
+    print("----------------------")
     
     # --- 主训练循环 ---
     global_metrics_history = []
-    for r in range(1, NUM_ROUNDS + 1):
-        print(f"\n{'='*20} 第 {r} 轮开始 (基于区块 {latest_lower_block.hash[:6]}) {'='*20}")
+    
+    # 创建一个持久化的进程池，在所有轮次中重复使用
+    with Pool(processes=MAX_CONCURRENT_WORKERS) as pool:
+        for r in range(1, NUM_ROUNDS + 1):
+            print(f"\n{'='*20} 第 {r} 轮开始 (基于区块 {latest_lower_block.hash[:6]}) {'='*20}")
 
-        # 为了跨进程传递，序列化模型参数
-        lower_block_dict = copy.deepcopy(latest_lower_block).__dict__
-        lower_block_dict["aggregated_global_model"] = parameters_to_serializable(latest_lower_block.aggregated_global_model)
+            # 为了跨进程传递，序列化模型参数
+            lower_block_dict = copy.deepcopy(latest_lower_block).__dict__
+            lower_block_dict["aggregated_global_model"] = parameters_to_serializable(latest_lower_block.aggregated_global_model)
 
-        # ... [并行训练部分保持不变] ...
-        # 3. 创建进程池并分发任务 (现在传递partition而不是partition_id)
-        tasks = [(f"client_{i}", partitions[i], valloader, class_weights, lower_block_dict, r) for i in range(NUM_NODES)]
-        
-        with Pool(processes=MAX_CONCURRENT_WORKERS) as pool:
-            collected_blocks_data = pool.map(node_process, tasks)
+            # 3. 创建任务列表
+            tasks = [(f"client_{i}", partitions[i], valloader, class_weights, lower_block_dict, r) for i in range(NUM_NODES)]
+            
+            # 使用持久化的进程池执行任务
+            collected_blocks_data = pool.map(worker_process_stateful, tasks)
 
-        print(f"\n--- 第 {r} 轮：所有节点已并行完成训练和PoW ---")
-        
-        # ... [聚合部分保持不变] ...
-        collected_blocks = []
-        for data in collected_blocks_data:
-            data["model_params"] = serializable_to_parameters(data["model_params"])
-            collected_blocks.append(UpperChainBlock(**data))
-        print(f"\n--- 第 {r} 轮：所有节点的本地评估结果 ---")
-        for block in collected_blocks:
-            print(f"  - {block.client_id}: Mean IoU = {block.metrics.get('mean_iou', 0):.4f}, FG Acc = {block.metrics.get('fg_pixel_accuracy', 0):.4f}")
-        print("---------------------------------")
-        standard_block = collected_blocks[0]
-        forked_blocks = collected_blocks[1:]
-        new_global_model_params = federated_average(collected_blocks)
-        
-        # 5. 创建新的下链区块
-        latest_lower_block = LowerChainBlock(
-            round=r,
-            standard_upper_block_hash=standard_block.hash,
-            forked_upper_block_hashes=[b.hash for b in forked_blocks],
-            aggregated_global_model=new_global_model_params,
-            parent_lower_hash=latest_lower_block.hash
-        )
-        latest_lower_block.hash = latest_lower_block.calculate_hash()
+            print(f"\n--- 第 {r} 轮：所有节点已并行完成本地训练 ---")
+            
+            # 4. 反序列化所有收集到的上链区块
+            collected_blocks = []
+            for data in collected_blocks_data:
+                data["model_params"] = serializable_to_parameters(data["model_params"])
+                collected_blocks.append(UpperChainBlock(**data))
+            
+            # 5. PoS委员会选举：根据信誉选出一个收敛节点
+            client_ids = list(reputation_ledger.keys())
+            reputations = list(reputation_ledger.values())
+            
+            convergence_node_id = random.choices(client_ids, weights=reputations, k=1)[0]
+            print(f"\n--- PoS选举结果 ---")
+            print(f"节点 {convergence_node_id} 被选为本轮的收敛节点 (信誉: {reputation_ledger[convergence_node_id]:.4f})")
+            print("--------------------")
 
-        print(f"\n--- 第 {r} 轮结束 ---")
-        print(f"新的全局模型已在主进程中成功聚合。")
+            # 6. 由收敛节点进行聚合
+            # 在这个模拟中，我们直接在主进程中完成聚合，但标记它是由谁完成的
+            print(f"收敛节点 {convergence_node_id}: 开始聚合模型...")
+            # 简单起见，我们假设收敛节点总是诚实的，并选择第一个区块作为标准
+            standard_block = next(b for b in collected_blocks if b.client_id == convergence_node_id)
+            forked_blocks = [b for b in collected_blocks if b.client_id != convergence_node_id]
+            new_global_model_params = federated_average(collected_blocks)
+            print(f"收敛节点 {convergence_node_id}: 模型聚合完成。")
 
-        # --- [核心修改] 在每轮结束后评估全局模型 ---
-        print(f"\n--- 正在评估第 {r} 轮聚合后的全局模型性能 ---")
-        eval_node = FederatedNode(node_id="eval_node", network=None, valloader=valloader, class_weights=class_weights)
-        eval_node.set_model_parameters(new_global_model_params)
-        loss, metrics = test(net=eval_node.model, testloader=eval_node.valloader, device=DEVICE)
-        metrics["loss"] = loss
-        global_metrics_history.append(metrics)
-        print(f" >> 第 {r} 轮全局模型评估结果: Mean IoU = {metrics['mean_iou']:.4f}, Loss = {loss:.4f}")
+            # 7. 信誉更新 (对所有参与节点)
+            print(f"\n--- 主进程 (模拟委员会) 更新信誉 ---")
+            for block in collected_blocks:
+                client_id = block.client_id
+                loss = block.metrics.get('loss', 10.0) # 如果没有loss，给予高惩罚
+                quality_score = 1.0 / (1.0 + loss)
+                
+                old_reputation = reputation_ledger[client_id]
+                reputation_ledger[client_id] = (EMA_ALPHA * quality_score) + (1 - EMA_ALPHA) * old_reputation
+
+            # 归一化声誉
+            total_reputation = sum(reputation_ledger.values())
+            for cid in reputation_ledger:
+                reputation_ledger[cid] /= total_reputation
+            
+            print("更新后信誉分布:")
+            for cid, rep in sorted(reputation_ledger.items(), key=lambda item: item[1], reverse=True):
+                 print(f"    - {cid}: {rep:.4f}")
+            print("--------------------------")
+
+            # 8. 创建新的下链区块
+            latest_lower_block = LowerChainBlock(
+                round=r,
+                standard_upper_block_hash=standard_block.hash,
+                forked_upper_block_hashes=[b.hash for b in forked_blocks],
+                aggregated_global_model=new_global_model_params,
+                parent_lower_hash=latest_lower_block.hash
+            )
+            latest_lower_block.hash = latest_lower_block.calculate_hash()
+
+            print(f"\n--- 第 {r} 轮结束 ---")
+            print(f"新的全局模型已在主进程中成功聚合。")
+
+            # --- [核心修改] 在每轮结束后评估全局模型 ---
+            print(f"\n--- 正在评估第 {r} 轮聚合后的全局模型性能 ---")
+            eval_node = FederatedNode(node_id="eval_node", network=None, valloader=valloader, class_weights=class_weights)
+            eval_node.set_model_parameters(new_global_model_params)
+            loss, metrics = test(net=eval_node.model, testloader=eval_node.valloader, device=DEVICE)
+            metrics["loss"] = loss
+            global_metrics_history.append(metrics)
+            print(f" >> 第 {r} 轮全局模型评估结果: Mean IoU = {metrics['mean_iou']:.4f}, Loss = {loss:.4f}")
 
     # --- 在所有轮次结束后，打印最终总结 ---
     print("\n\n" + "="*30 + " 最终仿真结果总结 " + "="*30)

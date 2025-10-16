@@ -30,6 +30,7 @@ class FederatedNode(Node):
         self.trainloader = trainloader
         self.valloader = valloader
         self.class_weights = class_weights # 接收计算好的权重
+        self.reputation = 0.1 # 节点的初始信誉值
 
     def get_model_parameters(self) -> List[np.ndarray]:
         """从本地模型中提取参数，格式为NumPy数组列表"""

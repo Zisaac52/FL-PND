@@ -40,21 +40,15 @@ class Node:
         else:
             self._handle_upper_block(data)
 
-    def _validate_upper_block(self, block: UpperChainBlock, difficulty: int = 2) -> bool:
+    def _validate_upper_block(self, block: UpperChainBlock) -> bool:
         """验证一个上链区块的有效性"""
         # 1. 验证哈希
         expected_hash = block.calculate_hash()
         if block.hash != expected_hash:
             print(f"节点 {self.node_id}: [验证失败] 上链区块 {block.hash[:6]} 哈希不匹配。")
             return False
-        
-        # 2. 验证PoW难度
-        prefix = "0" * difficulty
-        if not block.hash.startswith(prefix):
-            print(f"节点 {self.node_id}: [验证失败] 上链区块 {block.hash[:6]} 未满足PoW难度。")
-            return False
 
-        # 3. 验证父区块是否存在 (简化验证)
+        # 2. 验证父区块是否存在 (简化验证)
         if block.parent_lower_hash not in self.lower_chain:
             print(f"节点 {self.node_id}: [验证失败] 上链区块 {block.hash[:6]} 的父下链区块未知。")
             return False
