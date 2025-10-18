@@ -15,14 +15,6 @@ def simulate_training(node_id: str, global_model: dict) -> dict:
     trained_model["accuracy"] = random.uniform(0.6, 0.9)
     return trained_model
 
-def perform_pow(block: UpperChainBlock, difficulty: int) -> UpperChainBlock:
-    """模拟工作量证明"""
-    prefix = "0" * difficulty
-    while not block.hash.startswith(prefix):
-        block.nonce += 1
-        block.hash = block.calculate_hash()
-    print(f"节点 {block.client_id}: PoW完成! Nonce={block.nonce}, Hash={block.hash[:8]}...")
-    return block
 
 def aggregate_models(blocks: list[UpperChainBlock]) -> dict:
     """模拟FedAvg聚合"""
@@ -72,8 +64,6 @@ def run_simulation():
             parent_lower_hash=genesis_lower_block.hash
         )
         upper_block.hash = upper_block.calculate_hash()
-        # 执行PoW
-        upper_block = perform_pow(upper_block, difficulty=2)
         node.broadcast_upper_block(upper_block)
 
     # 4. 选出收敛节点并进行聚合

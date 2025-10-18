@@ -14,6 +14,7 @@ class UpperChainBlock:
     dataset_size: int
     model_params: ModelParameters
     parent_lower_hash: str
+    model_size_bytes: int = 0
     
     # --- 有默认值的字段 ---
     metrics: Dict[str, float] = field(default_factory=dict)

@@ -7,6 +7,7 @@ from multiprocessing import Pool
 from typing import List
 import copy
 import os
+import gc
 
 from .network import Network
 from .federated_node import FederatedNode, test, DEVICE
@@ -54,36 +55,27 @@ def federated_average(updates: List[UpperChainBlock]) -> List[np.ndarray]:
         
     return aggregated_params_np
 
-# --- 仿真主流程 ---
+def get_params_size_in_bytes(params: List[np.ndarray]) -> int:
+    """计算模型参数列表的总字节大小"""
+    return sum(p.nbytes for p in params)
 
-# 全局工作节点缓存，用于在每个工作进程中保持状态
-worker_nodes_cache = {}
-
-def worker_process_stateful(args):
+def node_process(args):
     """
-    一个有状态的工作进程函数。它在第一次为一个给定的client_id调用时创建节点，
-    并在同一进程中的后续调用中重用它。
+    一个无状态的工作进程函数。每次调用都会创建一个新的节点实例来执行任务。
     """
-    global worker_nodes_cache
     node_id, partition, valloader, class_weights, lower_block_dict, current_round = args
 
-    # 检查此客户端ID的节点是否已在此工作进程中初始化
-    if node_id not in worker_nodes_cache:
-        print(f"工作进程 {os.getpid()}: 正在为 {node_id} 初始化新的FederatedNode...")
-        # 在一个新进程中，为此节点创建DataLoader
-        trainloader = get_dataloader(partition, batch_size=4, is_train=True)
-        # 创建并缓存节点。这是昂贵的部分（模型创建，GPU传输）
-        node = FederatedNode(
-            node_id=node_id,
-            network=None,
-            trainloader=trainloader,
-            valloader=valloader,
-            class_weights=class_weights
-        )
-        worker_nodes_cache[node_id] = node
-    else:
-        # 从缓存中重用现有节点
-        node = worker_nodes_cache[node_id]
+    # 在子进程中创建 DataLoader
+    trainloader = get_dataloader(partition, batch_size=4, is_train=True)
+
+    # 创建节点实例
+    node = FederatedNode(
+        node_id=node_id,
+        network=None,
+        trainloader=trainloader,
+        valloader=valloader,
+        class_weights=class_weights
+    )
 
     # 反序列化下链区块以获取新的全局模型
     lower_block = LowerChainBlock(**lower_block_dict)
@@ -104,7 +96,8 @@ def worker_process_stateful(args):
         dataset_size=len(node.trainloader.dataset),
         model_params=updated_params,
         metrics=metrics,
-        parent_lower_hash=lower_block.hash
+        parent_lower_hash=lower_block.hash,
+        model_size_bytes=get_params_size_in_bytes(updated_params)
     )
     upper_block.hash = upper_block.calculate_hash()
     
@@ -163,11 +156,13 @@ def run_federated_simulation():
     
     # --- 主训练循环 ---
     global_metrics_history = []
+    system_metrics_history = []
     
     # 创建一个持久化的进程池，在所有轮次中重复使用
     with Pool(processes=MAX_CONCURRENT_WORKERS) as pool:
         for r in range(1, NUM_ROUNDS + 1):
             print(f"\n{'='*20} 第 {r} 轮开始 (基于区块 {latest_lower_block.hash[:6]}) {'='*20}")
+            round_start_time = time.time()
 
             # 为了跨进程传递，序列化模型参数
             lower_block_dict = copy.deepcopy(latest_lower_block).__dict__
@@ -177,7 +172,7 @@ def run_federated_simulation():
             tasks = [(f"client_{i}", partitions[i], valloader, class_weights, lower_block_dict, r) for i in range(NUM_NODES)]
             
             # 使用持久化的进程池执行任务
-            collected_blocks_data = pool.map(worker_process_stateful, tasks)
+            collected_blocks_data = pool.map(node_process, tasks)
 
             print(f"\n--- 第 {r} 轮：所有节点已并行完成本地训练 ---")
             
@@ -247,16 +242,30 @@ def run_federated_simulation():
             global_metrics_history.append(metrics)
             print(f" >> 第 {r} 轮全局模型评估结果: Mean IoU = {metrics['mean_iou']:.4f}, Loss = {loss:.4f}")
 
+            # --- [新增] 系统性能指标计算 ---
+            round_end_time = time.time()
+            round_duration = round_end_time - round_start_time
+            throughput = NUM_NODES / round_duration
+            total_upload_bytes = sum(b.model_size_bytes for b in collected_blocks)
+            
+            system_metrics = {
+                "latency": round_duration,
+                "throughput": throughput,
+                "upload_mb": total_upload_bytes / (1024 * 1024)
+            }
+            system_metrics_history.append(system_metrics)
+            print(f" >> 第 {r} 轮系统性能: Latency = {round_duration:.2f}s, Throughput = {throughput:.2f} updates/sec, Upload = {system_metrics['upload_mb']:.2f} MB")
+
     # --- 在所有轮次结束后，打印最终总结 ---
     print("\n\n" + "="*30 + " 最终仿真结果总结 " + "="*30)
     print(f"总轮次: {NUM_ROUNDS}, 客户端数量: {NUM_NODES}")
     print("\n全局模型性能演进:")
-    print("----------------------------------------------------------")
-    print("| Round |    Loss    |  Mean IoU  | FG Pixel Acc |")
-    print("----------------------------------------------------------")
-    for i, metrics in enumerate(global_metrics_history):
-        print(f"|   {i+1}   |  {metrics['loss']:.4f}  |  {metrics['mean_iou']:.4f}  |    {metrics['fg_pixel_accuracy']:.4f}    |")
-    print("----------------------------------------------------------")
+    print("-------------------------------------------------------------------------------------------------")
+    print("| Round |    Loss    |  Mean IoU  | FG Pixel Acc | Latency (s) | Throughput (ups/s) | Upload (MB) |")
+    print("-------------------------------------------------------------------------------------------------")
+    for i, (ml_metrics, sys_metrics) in enumerate(zip(global_metrics_history, system_metrics_history)):
+        print(f"|   {i+1}   |  {ml_metrics['loss']:.4f}  |  {ml_metrics['mean_iou']:.4f}  |    {ml_metrics['fg_pixel_accuracy']:.4f}    | {sys_metrics['latency']:^11.2f} | {sys_metrics['throughput']:^18.2f} | {sys_metrics['upload_mb']:^11.2f} |")
+    print("-------------------------------------------------------------------------------------------------")
 
 
 if __name__ == "__main__":
