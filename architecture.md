@@ -28,7 +28,7 @@
     *   `parent_upper_hash`: 指向上一个标准上链区块的哈希。
     *   `parent_lower_hash`: 指向上一个下链区块的哈希。
     *   `zkp_proof` (可选): 未来用于验证训练过程的零知识证明。
-*   **生成方式**: 客户端需要解决一个低难度的 **Proof of Work (PoW)**。这主要是为了防止女巫攻击和网络垃圾信息，而非共识机制。
+*   **生成方式**: 客户端在完成本地训练后，直接将 `parent_lower_hash`、局部指标和模型摘要签名打包进区块，并通过信誉/身份白名单做速率限制，无需 PoW。Sybil 防护由注册身份、每轮仅允许一个区块及信誉惩罚机制共同提供。
 
 #### 3.1.2 Lower-Chain Block (下链区块 / 全局模型区块)
 
@@ -55,7 +55,7 @@
 1.  **分发**: 客户端 `C` 监听到新的 `Lower-Chain Block (Round r)` 被网络接受。
 2.  `C` 从该区块中解析出 `aggregated_global_model` 字段，并将其加载为本地模型。
 3.  **本地训练**: `C` 在本地数据集上进行训练。
-4.  **发布**: 训练完成后，`C` 创建一个 `Upper-Chain Block`，引用 `Lower-Chain Block (Round r)` 的哈希，并通过PoW挖矿后广播出去。
+4.  **发布**: 训练完成后，`C` 创建一个 `Upper-Chain Block`，引用 `Lower-Chain Block (Round r)` 的哈希，附带本地签名/信誉证明后直接广播。
 5.  **聚合 (由收敛节点 `S` 执行)**:
     *   节点 `S` (上一轮的标准区块创建者) 收集所有指向 `Lower-Chain Block (Round r)` 的 `Upper-Chain Block`。
     *   等待一个预设的超时时间后，`S` 根据“最难链原则”选出本轮的 `standard_upper_block`。
@@ -71,7 +71,7 @@ graph TD
     B --> C[Find Latest Lower-Chain Block];
     C --> D[Load Global Model];
     D --> E[Local Training];
-    E --> F[Create Upper-Chain Block (with PoW)];
+    E --> F[Create Upper-Chain Block (signed)];
     F --> G[Broadcast to Network];
     G --> H{Wait for next Lower-Chain Block};
     

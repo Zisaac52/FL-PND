@@ -217,7 +217,7 @@ def run_federated_simulation():
             
             print("更新后信誉分布:")
             for cid, rep in sorted(reputation_ledger.items(), key=lambda item: item[1], reverse=True):
-                 print(f"    - {cid}: {rep:.4f}")
+                print(f"    - {cid}: {rep:.4f}")
             print("--------------------------")
 
             # 8. 创建新的下链区块

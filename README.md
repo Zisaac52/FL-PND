@@ -69,7 +69,7 @@ PND/
 
 ## How to Run
 
-The simulation is launched using the custom `run.py` script, which provides full control over the Ray backend and resource allocation.
+The simulation is launched using the custom `run.py` script, which now orchestrates Ray setup, Flower sampling, and the Ladder-inspired reputation chain.
 
 Simply run the following command from the project root directory (`PND/`):
 
@@ -80,8 +80,29 @@ python run.py
 The script will:
 1.  Initialize a local Ray cluster with GPU support.
 2.  Load the dataset and calculate class weights.
-3.  Start the Flower simulation for the number of rounds specified in `fl-pnd/server_app.py`.
-4.  Print the final training history (loss and foreground mIoU) upon completion.
+3.  Start the Ladder-aware Flower simulation for the number of rounds you specify (either in the CLI or `fl-pnd/server_app.py` defaults).
+4.  Print the final training history (loss and foreground mIoU) plus a compact per-round summary table.
+
+### Customize the Simulation
+
+All core hyperparameters can be passed directly to `run.py`:
+
+```bash
+python run.py \
+    --num-clients 10 \
+    --num-rounds 5 \
+    --local-epochs 2 \
+    --fit-fraction 0.8 \
+    --eval-fraction 0.3
+```
+
+- `--num-clients`: total virtual clients managed by Ray (default `10`)
+- `--num-rounds`: number of federated rounds (default `3`)
+- `--local-epochs`: local epochs per selected client (default `1`)
+- `--fit-fraction`: fraction of clients sampled for training (default `1.0`)
+- `--eval-fraction`: portion of clients sampled for evaluation (default `0.3`)
+
+These flags flow directly into the custom Flower strategy, so both training and evaluation automatically obey the configuration you pass at runtime.
 
 ## Future Work
 
