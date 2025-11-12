@@ -104,6 +104,21 @@ python run.py \
 
 These flags flow directly into the custom Flower strategy, so both training and evaluation automatically obey the configuration you pass at runtime.
 
+### Blockchain-Oriented Metrics
+
+`run.py` now reports a second table after each simulation which captures the DAG/blockchain perspective:
+
+| Metric | Description |
+| --- | --- |
+| `Latency (s)` | Wall-clock time spent in each federated round (from sampling to LowerChainBlock creation). |
+| `Training Latency (s)` | Max local training time among all clients in the round. |
+| `Consensus Latency (s)` | Portion of the round spent after training (aggregation, block creation). |
+| `Throughput (blocks/s)` | Confirmed UpperChainBlocks per second (standard + forks). |
+| `Upload (MB)` | Aggregate model bytes uploaded to the server that round. |
+| `Blocks` / `Forks` | Count of standard + forked blocks included in the LowerChainBlock. |
+
+These stats are logged automatically and can be copy/pasted into experiment reports for latency/吞吐量分析。
+
 ## Future Work
 
 The next major step for this project is to integrate blockchain technology to enhance the security, traceability, and incentive mechanisms of the federated learning process.

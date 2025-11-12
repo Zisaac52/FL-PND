@@ -4,7 +4,9 @@ fl-pnd: Flower server components with Ladder-inspired DAG coordination.
 from __future__ import annotations
 
 import json
+import math
 import random
+import time
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -80,6 +82,9 @@ class LadderStrategy(fl.server.strategy.FedAvg):
             str(i): 1.0 / num_clients for i in range(num_clients)
         }
         self.ema_alpha = EMA_ALPHA
+        self.round_start_perf: Dict[int, float] = {}
+        self.round_start_wall: Dict[int, float] = {}
+        self.round_chain_metrics: List[Dict[str, float]] = []
 
         temp_net = get_net()
         initial_params = [val.cpu().numpy() for _, val in temp_net.state_dict().items()]
@@ -96,6 +101,8 @@ class LadderStrategy(fl.server.strategy.FedAvg):
         self.on_fit_config_fn = self._fit_config
 
     def _fit_config(self, server_round: int) -> Dict[str, int]:
+        self.round_start_perf[server_round] = time.perf_counter()
+        self.round_start_wall[server_round] = time.time()
         return {
             "server_round": server_round,
             "latest_lower_hash": self.latest_lower_block.hash,
@@ -108,6 +115,8 @@ class LadderStrategy(fl.server.strategy.FedAvg):
         results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
         failures,
     ):
+        round_start_ts = self.round_start_perf.pop(server_round, None)
+        round_start_wall = self.round_start_wall.pop(server_round, None)
         print(f"\n--- [Round {server_round}] Ladder/DAG aggregation start ---")
         received_blocks: List[UpperChainBlock] = []
         for _, fit_res in results:
@@ -123,6 +132,8 @@ class LadderStrategy(fl.server.strategy.FedAvg):
                 parent_lower_hash=payload["parent_lower_hash"],
                 metrics=payload["metrics"],
                 model_params=params,
+                training_time=payload.get("training_time", 0.0),
+                train_finish_ts=payload.get("train_finish_ts", 0.0),
             )
             block.hash = block.calculate_hash()
             received_blocks.append(block)
@@ -185,6 +196,59 @@ class LadderStrategy(fl.server.strategy.FedAvg):
         print(
             f"    · LowerChainBlock {self.latest_lower_block.hash[:6]} created "
             f"(round={server_round}, parent={self.latest_lower_block.parent_lower_hash[:6]})"
+        )
+
+        upload_bytes = 0
+        training_latency = float("nan")
+        consensus_latency = float("nan")
+        if received_blocks:
+            upload_bytes = sum(
+                sum(arr.nbytes for arr in block.model_params) for block in received_blocks
+            )
+            finish_times = [
+                ts for ts in (block.train_finish_ts for block in received_blocks) if ts
+            ]
+            if finish_times and round_start_wall:
+                training_latency = max(finish_times) - round_start_wall
+            else:
+                training_latency = max(
+                    (block.training_time for block in received_blocks),
+                    default=float("nan"),
+                )
+
+        latency = (
+            time.perf_counter() - round_start_ts
+            if round_start_ts is not None
+            else float("nan")
+        )
+        throughput = (
+            len(received_blocks) / latency if latency and latency > 0 else float("nan")
+        )
+        if (
+            isinstance(latency, (int, float))
+            and latency == latency
+            and isinstance(training_latency, (int, float))
+            and not math.isnan(training_latency)
+        ):
+            consensus_latency = max(latency - training_latency, 0.0)
+        else:
+            consensus_latency = float("nan")
+        self.round_chain_metrics.append(
+            {
+                "round": server_round,
+                "latency": latency,
+                "training_latency": training_latency,
+                "consensus_latency": consensus_latency,
+                "throughput": throughput,
+                "consensus_throughput": (
+                    len(received_blocks) / consensus_latency
+                    if consensus_latency and consensus_latency > 0
+                    else float("nan")
+                ),
+                "upload_mb": upload_bytes / (1024 * 1024),
+                "num_blocks": len(received_blocks),
+                "forks": len(forked_blocks),
+            }
         )
 
         return aggregated_params, {}

@@ -56,7 +56,7 @@ def _extract_eval_metrics(history):
     return {}
 
 
-def print_history_summary(history, total_rounds: int, num_clients: int):
+def print_history_summary(history, total_rounds: int, num_clients: int, chain_metrics=None):
     """Render a compact table similar to ladder-fl/run_federated.py output."""
     losses = {}
     if history.losses_distributed:
@@ -75,6 +75,24 @@ def print_history_summary(history, total_rounds: int, num_clients: int):
     print(f"总轮次: {total_rounds}, 客户端数量: {num_clients}\n")
     print("全局模型性能演进:")
     print(line)
+
+    if chain_metrics:
+        print("\n区块链性能指标:")
+        line_chain = "-" * 166
+        print(line_chain)
+        print("| Round | Latency (s) | Training Latency (s) | Consensus Latency (s) | Throughput (blocks/s) | Consensus Throughput (blocks/s) | Upload (MB) | Blocks | Forks |")
+        print(line_chain)
+        for entry in chain_metrics:
+            print(
+                f"|{entry['round']:>4}   | {entry['latency']:11.2f} |"
+                f" {entry.get('training_latency', float('nan')):21.2f} |"
+                f" {entry.get('consensus_latency', float('nan')):22.2f} |"
+                f" {entry['throughput']:23.2f} |"
+                f" {entry.get('consensus_throughput', float('nan')):32.2f} |"
+                f" {entry['upload_mb']:11.2f} |"
+                f" {entry['num_blocks']:6} | {entry['forks']:5} |"
+            )
+        print(line_chain)
     print("| Round |    Loss    |  Mean IoU  | FG Pixel Acc |")
     print(line)
     for rnd in rounds:
@@ -190,10 +208,12 @@ if __name__ == "__main__":
     )
 
     print("\n--- Simulation Finished ---")
+    chain_metrics = getattr(server_components.strategy, "round_chain_metrics", None)
     print_history_summary(
         history,
         total_rounds=args.num_rounds,
         num_clients=NUM_CLIENTS,
+        chain_metrics=chain_metrics,
     )
 
     # 7. 关闭 Ray

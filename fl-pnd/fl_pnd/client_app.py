@@ -6,6 +6,7 @@ import os
 os.environ["MKL_THREADING_LAYER"] = "GNU"
 
 import json
+import time
 
 import flwr as fl
 import torch
@@ -43,6 +44,8 @@ class FlowerClient(fl.client.NumPyClient):
         parent_lower_hash = config.get("latest_lower_hash", "GENESIS")
         
         local_epochs = int(config.get("local_epochs", 1))
+        start_perf = time.perf_counter()
+        start_wall = time.time()
         print(f"--- 客户端 {self.cid} 开始训练 (设备: {DEVICE}, 轮次: {current_round}, epochs: {local_epochs}) ---")
         train(
             net=self.net, 
@@ -58,6 +61,8 @@ class FlowerClient(fl.client.NumPyClient):
         # 评估本地更新后的模型，以获取最新的 metrics
         loss, metrics = test(net=self.net, testloader=self.valloader, device=DEVICE)
         metrics["loss"] = loss
+        training_time = time.perf_counter() - start_perf
+        train_finish_ts = time.time()
 
         # 为服务器准备一个 UpperChainBlock 所需的payload（无 PoW，仅签名/信誉）
         block_payload = {
@@ -65,6 +70,8 @@ class FlowerClient(fl.client.NumPyClient):
             "dataset_size": self.dataset_size,
             "parent_lower_hash": parent_lower_hash,
             "metrics": metrics,
+            "training_time": training_time,
+            "train_finish_ts": train_finish_ts,
         }
 
         serialized_params_bytes = parameters_to_serializable(updated_params)
