@@ -104,6 +104,11 @@ python run.py \
 
 These flags flow directly into the custom Flower strategy, so both training and evaluation automatically obey the configuration you pass at runtime.
 
+### Payload Compression & Lighter Clients
+
+Clients now transmit **float16 model deltas (Δw)** instead of full precision weights. For each round, the client caches the received global model `W_t`, trains locally to obtain `W'_t`, computes `Δw = W'_t - W_t`, and uploads the FP16-compressed delta. The server aggregates the deltas, reconstructs the next global model, and keeps full weights inside the LowerChainBlock.  
+同时，`fit()` 阶段不再执行昂贵的验证集评估，而是直接使用训练过程返回的平均损失来更新信誉。这两个改动显著降低了 Training Latency，并将 Upload (MB) 减少到原来的约一半，为后续的 Top-K/量化等进阶压缩留出了空间。
+
 ### Blockchain-Oriented Metrics
 
 `run.py` now reports a second table after each simulation which captures the DAG/blockchain perspective:

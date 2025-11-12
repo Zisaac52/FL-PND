@@ -78,15 +78,16 @@ def print_history_summary(history, total_rounds: int, num_clients: int, chain_me
 
     if chain_metrics:
         print("\n区块链性能指标:")
-        line_chain = "-" * 166
+        line_chain = "-" * 191
         print(line_chain)
-        print("| Round | Latency (s) | Training Latency (s) | Consensus Latency (s) | Throughput (blocks/s) | Consensus Throughput (blocks/s) | Upload (MB) | Blocks | Forks |")
+        print("| Round | Latency (s) | Training Latency (s) | Consensus Latency (s) | Other Latency (s) | Throughput (blocks/s) | Consensus Throughput (blocks/s) | Upload (MB) | Blocks | Forks |")
         print(line_chain)
         for entry in chain_metrics:
             print(
                 f"|{entry['round']:>4}   | {entry['latency']:11.2f} |"
                 f" {entry.get('training_latency', float('nan')):21.2f} |"
                 f" {entry.get('consensus_latency', float('nan')):22.2f} |"
+                f" {entry.get('other_latency', float('nan')):19.2f} |"
                 f" {entry['throughput']:23.2f} |"
                 f" {entry.get('consensus_throughput', float('nan')):32.2f} |"
                 f" {entry['upload_mb']:11.2f} |"

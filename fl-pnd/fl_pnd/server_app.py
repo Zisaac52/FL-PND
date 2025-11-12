@@ -119,6 +119,9 @@ class LadderStrategy(fl.server.strategy.FedAvg):
         round_start_wall = self.round_start_wall.pop(server_round, None)
         print(f"\n--- [Round {server_round}] Ladder/DAG aggregation start ---")
         received_blocks: List[UpperChainBlock] = []
+        consensus_start = None
+        consensus_end = None
+
         for _, fit_res in results:
             payload_json = fit_res.metrics.get("upper_block_payload_json")
             params_bytes = fit_res.metrics.get("serializable_params_bytes")
@@ -134,6 +137,7 @@ class LadderStrategy(fl.server.strategy.FedAvg):
                 model_params=params,
                 training_time=payload.get("training_time", 0.0),
                 train_finish_ts=payload.get("train_finish_ts", 0.0),
+                model_size_bytes=payload.get("model_size_bytes", 0),
             )
             block.hash = block.calculate_hash()
             received_blocks.append(block)
@@ -147,8 +151,16 @@ class LadderStrategy(fl.server.strategy.FedAvg):
             print("    · No valid blocks received, falling back to FedAvg.")
             return super().aggregate_fit(server_round, results, failures)
 
-        aggregated_params_np = federated_average(received_blocks)
-        aggregated_params = fl.common.ndarrays_to_parameters(aggregated_params_np)
+        consensus_start = time.perf_counter()
+        aggregated_delta_np = federated_average(received_blocks)
+        current_global = [
+            np.array(arr, copy=True) for arr in self.latest_lower_block.aggregated_global_model
+        ]
+        new_global_params = [
+            global_param + delta_param
+            for global_param, delta_param in zip(current_global, aggregated_delta_np)
+        ]
+        aggregated_params = fl.common.ndarrays_to_parameters(new_global_params)
 
         # Reputation update based on reported loss (no PoW).
         for block in received_blocks:
@@ -189,7 +201,7 @@ class LadderStrategy(fl.server.strategy.FedAvg):
             round=server_round,
             standard_upper_block_hash=standard_block.hash,
             forked_upper_block_hashes=[b.hash for b in forked_blocks],
-            aggregated_global_model=aggregated_params_np,
+            aggregated_global_model=new_global_params,
             parent_lower_hash=self.latest_lower_block.hash,
         )
         self.latest_lower_block.hash = self.latest_lower_block.calculate_hash()
@@ -197,13 +209,14 @@ class LadderStrategy(fl.server.strategy.FedAvg):
             f"    · LowerChainBlock {self.latest_lower_block.hash[:6]} created "
             f"(round={server_round}, parent={self.latest_lower_block.parent_lower_hash[:6]})"
         )
+        consensus_end = time.perf_counter()
 
         upload_bytes = 0
         training_latency = float("nan")
-        consensus_latency = float("nan")
         if received_blocks:
             upload_bytes = sum(
-                sum(arr.nbytes for arr in block.model_params) for block in received_blocks
+                block.model_size_bytes or sum(arr.nbytes for arr in block.model_params)
+                for block in received_blocks
             )
             finish_times = [
                 ts for ts in (block.train_finish_ts for block in received_blocks) if ts
@@ -224,15 +237,11 @@ class LadderStrategy(fl.server.strategy.FedAvg):
         throughput = (
             len(received_blocks) / latency if latency and latency > 0 else float("nan")
         )
-        if (
-            isinstance(latency, (int, float))
-            and latency == latency
-            and isinstance(training_latency, (int, float))
-            and not math.isnan(training_latency)
-        ):
-            consensus_latency = max(latency - training_latency, 0.0)
-        else:
-            consensus_latency = float("nan")
+        consensus_latency = (
+            consensus_end - consensus_start
+            if consensus_start and consensus_end and consensus_end >= consensus_start
+            else float("nan")
+        )
         self.round_chain_metrics.append(
             {
                 "round": server_round,
@@ -243,6 +252,11 @@ class LadderStrategy(fl.server.strategy.FedAvg):
                 "consensus_throughput": (
                     len(received_blocks) / consensus_latency
                     if consensus_latency and consensus_latency > 0
+                    else float("nan")
+                ),
+                "other_latency": (
+                    latency - (training_latency + consensus_latency)
+                    if latency and training_latency == training_latency and consensus_latency == consensus_latency
                     else float("nan")
                 ),
                 "upload_mb": upload_bytes / (1024 * 1024),

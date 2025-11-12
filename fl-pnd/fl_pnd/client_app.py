@@ -7,6 +7,7 @@ os.environ["MKL_THREADING_LAYER"] = "GNU"
 
 import json
 import time
+import numpy as np
 
 import flwr as fl
 import torch
@@ -38,16 +39,16 @@ class FlowerClient(fl.client.NumPyClient):
     def fit(self, parameters, config):
         """Trains the local model, receiving the current server round from the config."""
         set_parameters(self.net, parameters)
-        
+        initial_params = [np.array(p, copy=True) for p in parameters]
+
         # 从服务器传递过来的 config 字典中获取当前轮数及最新下链哈希
         current_round = config.get("server_round", 0)
         parent_lower_hash = config.get("latest_lower_hash", "GENESIS")
         
         local_epochs = int(config.get("local_epochs", 1))
         start_perf = time.perf_counter()
-        start_wall = time.time()
         print(f"--- 客户端 {self.cid} 开始训练 (设备: {DEVICE}, 轮次: {current_round}, epochs: {local_epochs}) ---")
-        train(
+        avg_train_loss = train(
             net=self.net, 
             trainloader=self.trainloader, 
             epochs=local_epochs,
@@ -57,10 +58,17 @@ class FlowerClient(fl.client.NumPyClient):
         )
         
         updated_params = self.get_parameters(config={})
+        metrics = {"loss": float(avg_train_loss)}
 
-        # 评估本地更新后的模型，以获取最新的 metrics
-        loss, metrics = test(net=self.net, testloader=self.valloader, device=DEVICE)
-        metrics["loss"] = loss
+        delta_params = [
+            updated.astype(np.float32) - base.astype(np.float32)
+            for updated, base in zip(updated_params, initial_params)
+        ]
+        delta_params_fp16 = [delta.astype(np.float16) for delta in delta_params]
+        serialized_params_bytes = parameters_to_serializable(
+            delta_params_fp16, dtype="float16"
+        )
+        model_size_bytes = len(serialized_params_bytes)
         training_time = time.perf_counter() - start_perf
         train_finish_ts = time.time()
 
@@ -72,15 +80,17 @@ class FlowerClient(fl.client.NumPyClient):
             "metrics": metrics,
             "training_time": training_time,
             "train_finish_ts": train_finish_ts,
+            "payload_type": "delta",
+            "compression": "float16",
+            "model_size_bytes": model_size_bytes,
         }
 
-        serialized_params_bytes = parameters_to_serializable(updated_params)
         block_payload_json = json.dumps(block_payload)
 
         metrics_dict = {
             "upper_block_payload_json": block_payload_json,
             "serializable_params_bytes": serialized_params_bytes,
-            "local_loss": float(loss),
+            "local_loss": float(avg_train_loss),
         }
 
         return updated_params, self.dataset_size, metrics_dict

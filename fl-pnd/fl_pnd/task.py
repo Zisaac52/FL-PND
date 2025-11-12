@@ -77,6 +77,8 @@ def train(
         scheduler = StepLR(optimizer, step_size=100, gamma=1.0)
 
     net.train()
+    accumulated_epoch_loss = 0.0
+    epoch_counter = 0
     for epoch in range(epochs):
         epoch_loss = 0.0
         for images, masks in tqdm(trainloader, desc=f"Epoch {epoch+1}/{epochs}"):
@@ -150,6 +152,12 @@ def train(
         avg_epoch_loss = epoch_loss / len(trainloader)
         print(f"Epoch {epoch+1} training loss (foreground only): {avg_epoch_loss:.4f}")
         scheduler.step()
+        accumulated_epoch_loss += avg_epoch_loss
+        epoch_counter += 1
+
+    if epoch_counter == 0:
+        return 0.0
+    return accumulated_epoch_loss / epoch_counter
 
 # --- mIoU Helper Functions ---
 def _update_confusion_matrix(gt_label, pred_label, confusion_matrix):
