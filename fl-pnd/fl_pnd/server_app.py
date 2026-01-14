@@ -7,7 +7,7 @@ import json
 import math
 import random
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import torch
@@ -18,6 +18,13 @@ from flwr.server import ServerApp, ServerAppComponents, ServerConfig
 from .task import get_net
 from .data_structures import LowerChainBlock, UpperChainBlock
 from .serde import serializable_to_parameters
+from .zkp_fixed_l2 import verify_certificate as verify_fixed_l2
+from .zkp_bindings import (
+    RoFLL2Engine,
+    L2ProofArtifacts,
+    ZKPBindingError,
+    compute_payload_hash,
+)
 
 SERVER_DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 DEFAULT_NUM_CLIENTS = 10
@@ -73,6 +80,7 @@ class LadderStrategy(fl.server.strategy.FedAvg):
         self,
         num_clients: int = DEFAULT_NUM_CLIENTS,
         local_epochs: int = 1,
+        zkp_config: Optional[dict] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -85,6 +93,11 @@ class LadderStrategy(fl.server.strategy.FedAvg):
         self.round_start_perf: Dict[int, float] = {}
         self.round_start_wall: Dict[int, float] = {}
         self.round_chain_metrics: List[Dict[str, float]] = []
+        self.zkp_config = zkp_config or {}
+        self.zkp_scheme = str(self.zkp_config.get("scheme", "none")).lower()
+        enabled_flag = bool(self.zkp_config.get("enabled", False))
+        self.zkp_required = enabled_flag and self.zkp_scheme not in ("none", "")
+        self._zkp_engine: Optional[RoFLL2Engine] = None
 
         temp_net = get_net()
         initial_params = [val.cpu().numpy() for _, val in temp_net.state_dict().items()]
@@ -122,6 +135,15 @@ class LadderStrategy(fl.server.strategy.FedAvg):
         consensus_start = None
         consensus_end = None
 
+        zkp_l2_values: List[float] = []
+        zkp_rejected = 0
+
+        zkp_l2_values: List[float] = []
+        zkp_rejected = 0
+        zkp_verify_times: List[float] = []
+        zkp_prove_times: List[float] = []
+        zkp_proof_sizes: List[float] = []
+
         for _, fit_res in results:
             payload_json = fit_res.metrics.get("upper_block_payload_json")
             params_bytes = fit_res.metrics.get("serializable_params_bytes")
@@ -129,6 +151,25 @@ class LadderStrategy(fl.server.strategy.FedAvg):
                 continue
             payload = json.loads(payload_json)
             params = serializable_to_parameters(params_bytes)
+            zkp_payload = payload.get("zkp")
+            declared_hash = payload.get("delta_sha256", "")
+            zkp_verified = False
+            if self.zkp_required:
+                verified, l2_value, meta = self._verify_zkp_payload(
+                    zkp_payload, params, params_bytes, declared_hash
+                )
+                if not verified:
+                    zkp_rejected += 1
+                    continue
+                if l2_value is not None:
+                    zkp_l2_values.append(float(l2_value))
+                if meta:
+                    zkp_verify_times.append(meta.get("verify_time", 0.0))
+                    if meta.get("prove_time"):
+                        zkp_prove_times.append(meta["prove_time"])
+                    if meta.get("proof_bytes"):
+                        zkp_proof_sizes.append(meta["proof_bytes"])
+                zkp_verified = True
             block = UpperChainBlock(
                 client_id=payload["client_id"],
                 dataset_size=payload["dataset_size"],
@@ -138,7 +179,11 @@ class LadderStrategy(fl.server.strategy.FedAvg):
                 training_time=payload.get("training_time", 0.0),
                 train_finish_ts=payload.get("train_finish_ts", 0.0),
                 model_size_bytes=payload.get("model_size_bytes", 0),
+                delta_sha256=declared_hash,
+                zkp=zkp_payload or {},
             )
+            if self.zkp_required:
+                block.metrics["zkp_verified"] = 1.0 if zkp_verified else 0.0
             block.hash = block.calculate_hash()
             received_blocks.append(block)
             print(
@@ -262,10 +307,102 @@ class LadderStrategy(fl.server.strategy.FedAvg):
                 "upload_mb": upload_bytes / (1024 * 1024),
                 "num_blocks": len(received_blocks),
                 "forks": len(forked_blocks),
+                "zkp_l2_avg": (
+                    float(sum(zkp_l2_values) / len(zkp_l2_values))
+                    if zkp_l2_values
+                    else float("nan")
+                ),
+                "zkp_l2_max": max(zkp_l2_values) if zkp_l2_values else float("nan"),
+                "zkp_rejected": zkp_rejected,
+                "zkp_prove_avg": (
+                    float(sum(zkp_prove_times) / len(zkp_prove_times))
+                    if zkp_prove_times
+                    else float("nan")
+                ),
+                "zkp_verify_avg": (
+                    float(sum(zkp_verify_times) / len(zkp_verify_times))
+                    if zkp_verify_times
+                    else float("nan")
+                ),
+                "zkp_proof_kb": (
+                    float(
+                        sum(zkp_proof_sizes) / len(zkp_proof_sizes)
+                        / 1024.0
+                    )
+                    if zkp_proof_sizes
+                    else float("nan")
+                ),
             }
         )
 
         return aggregated_params, {}
+
+    def _get_zkp_engine(self) -> Optional[RoFLL2Engine]:
+        if not self.zkp_required or self.zkp_scheme != "rofl":
+            return None
+        if self._zkp_engine is None:
+            lib_path = self.zkp_config.get("lib_path")
+            self._zkp_engine = RoFLL2Engine(lib_path)
+        return self._zkp_engine
+
+    def _verify_zkp_payload(
+        self,
+        zkp_payload: Optional[Dict[str, Any]],
+        delta_params: List[np.ndarray],
+        params_bytes: bytes,
+        declared_hash: str,
+    ) -> Tuple[bool, Optional[float], Optional[Dict[str, float]]]:
+        if not zkp_payload:
+            print("    · Skipping block without ZKP payload.")
+            return False, None, None
+        scheme = str(
+            zkp_payload.get("scheme")
+            or zkp_payload.get("type")
+            or self.zkp_scheme
+        ).lower()
+        if scheme == "rofl_l2":
+            digest = compute_payload_hash(params_bytes)
+            if declared_hash and declared_hash != digest:
+                print("    · Skipping block with mismatching delta hash.")
+                return False, None, None
+            try:
+                artifacts = L2ProofArtifacts.from_payload(zkp_payload["artifacts"])
+                engine = self._get_zkp_engine()
+                start = time.perf_counter()
+                valid = bool(engine and engine.verify_l2_proof(artifacts))
+                verify_time = time.perf_counter() - start
+            except (KeyError, ZKPBindingError, FileNotFoundError, OSError) as exc:
+                print(f"    · Skipping block: invalid RoFL ZKP payload ({exc}).")
+                return False, None, None
+            if not valid:
+                print("    · Skipping block: RoFL ZKP verification failed.")
+                return False, None, None
+            return True, None, {"verify_time": verify_time}
+        if scheme == "fixed_l2":
+            certificate = zkp_payload.get("certificate", zkp_payload)
+            if certificate.get("float_hash") and declared_hash:
+                if certificate["float_hash"] != declared_hash:
+                    print("    · Skipping block: float delta hash mismatch (fixed_l2).")
+                    return False, None, None
+            max_tau = self.zkp_config.get("tau")
+            max_scale = self.zkp_config.get("scale")
+            start_verify = time.perf_counter()
+            valid = verify_fixed_l2(delta_params, certificate, max_tau=max_tau, max_scale=max_scale)
+            verify_time = time.perf_counter() - start_verify
+            if not valid:
+                print(
+                    "    · Skipping block: fixed-point L2 certificate rejected."
+                    f" cert_l2_sq={certificate.get('l2_sq')} "
+                    f"tau_sq={certificate.get('tau_sq')}"
+                )
+                return False, None, None
+            return True, certificate.get("l2_sq"), {
+                "verify_time": verify_time,
+                "prove_time": certificate.get("prove_time"),
+                "proof_bytes": certificate.get("proof_bytes"),
+            }
+        print(f"    · Skipping block: unsupported ZKP scheme '{scheme}'.")
+        return False, None, None
 
 
 def get_server_components(
@@ -274,6 +411,7 @@ def get_server_components(
     eval_fraction: float = 0.3,
     fit_fraction: float = 1.0,
     local_epochs: int = 1,
+    zkp_config: Optional[dict] = None,
 ) -> ServerAppComponents:
     """Prepare Ladder-aware FedAvg strategy plus config."""
     print("--- Initializing server strategy and config ---")
@@ -291,6 +429,7 @@ def get_server_components(
     strategy = LadderStrategy(
         num_clients=num_clients,
         local_epochs=local_epochs,
+        zkp_config=zkp_config,
         fraction_fit=fit_fraction,
         fraction_evaluate=eval_fraction,
         min_fit_clients=min_fit_clients,

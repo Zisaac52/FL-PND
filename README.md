@@ -93,7 +93,9 @@ python run.py \
     --num-rounds 5 \
     --local-epochs 2 \
     --fit-fraction 0.8 \
-    --eval-fraction 0.3
+    --eval-fraction 0.3 \
+    --enable-zkp \
+    --zkp-range-bits 16
 ```
 
 - `--num-clients`: total virtual clients managed by Ray (default `10`)
@@ -101,6 +103,10 @@ python run.py \
 - `--local-epochs`: local epochs per selected client (default `1`)
 - `--fit-fraction`: fraction of clients sampled for training (default `1.0`)
 - `--eval-fraction`: portion of clients sampled for evaluation (default `0.3`)
+- `--enable-zkp`: require each client update to carry a RoFL-style L2 zero-knowledge proof
+- `--zkp-range-bits`, `--zkp-partitions`, `--zkp-lib`: fine-tune the bound/checking parameters when proofs are enabled
+- `--zkp-scheme`: select `rofl` (Bulletproofs) or `fixed` (deterministic fixed-point certificate) for lighter experiments
+- `--zkp-scale`, `--zkp-clip`, `--zkp-tau`: configure the fixed-point encoder used by the lightweight scheme
 
 These flags flow directly into the custom Flower strategy, so both training and evaluation automatically obey the configuration you pass at runtime.
 
@@ -118,11 +124,45 @@ Clients now transmit **float16 model deltas (Δw)** instead of full precision we
 | `Latency (s)` | Wall-clock time spent in each federated round (from sampling to LowerChainBlock creation). |
 | `Training Latency (s)` | Max local training time among all clients in the round. |
 | `Consensus Latency (s)` | Portion of the round spent after training (aggregation, block creation). |
+| `Other Latency (s)` | Residual bookkeeping time (logging, client orchestration) after removing training + consensus segments. |
 | `Throughput (blocks/s)` | Confirmed UpperChainBlocks per second (standard + forks). |
+| `Consensus Throughput (blocks/s)` | Pure DAG throughput based on verified blocks divided by consensus-only latency. |
 | `Upload (MB)` | Aggregate model bytes uploaded to the server that round. |
 | `Blocks` / `Forks` | Count of standard + forked blocks included in the LowerChainBlock. |
 
 These stats are logged automatically and can be copy/pasted into experiment reports for latency/吞吐量分析。
+
+## Optional: RoFL ZKP Integration
+
+The Ladder strategy can now enforce the same L2-norm range proofs described in *RoFL: Robustness of Secure Federated Learning* (Lycklama et al.). Proof generation and verification run through the upstream `librofl_crypto.so` and reuse the Δw payloads you already transmit.
+
+### Building `librofl_crypto.so`
+
+1. Clone the official reference implementation (already included under `RoFL/rofl-project-code` in this workspace).
+2. Install the pinned Rust toolchain:  
+   ```bash
+   rustup override set nightly-2022-07-24
+   ```
+3. Compile the crypto crate in release mode:  
+   ```bash
+   cd RoFL/rofl-project-code
+   cargo build --release -p rofl_crypto
+   ```
+4. Copy the shared library where the Python bindings expect it (already wired to `fl-pnd/zkp/librofl_crypto.so`):  
+   ```bash
+   mkdir -p fl-pnd/zkp
+   cp RoFL/rofl-project-code/target/release/librofl_crypto.so fl-pnd/zkp/
+   ```
+
+### Enforcing Proofs at Runtime
+
+Run `python run.py --enable-zkp` to activate the RoFL proof pipeline. Each client will:
+
+1. Compute its FP32 delta vector before compression.
+2. Call `librofl_crypto` to generate L2 range proofs (you can tune `--zkp-range-bits` and `--zkp-partitions`).
+3. Attach the proof bundle plus the SHA-256 hash of the transmitted delta to the UpperChain block.
+
+The server verifies the proof and hash before accepting a block; invalid or missing proofs are automatically discarded. This keeps consensus latency low while guaranteeing every accepted Δw stays within the configured L2 bound.
 
 ## Future Work
 

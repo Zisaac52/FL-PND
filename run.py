@@ -80,7 +80,7 @@ def print_history_summary(history, total_rounds: int, num_clients: int, chain_me
         print("\n区块链性能指标:")
         line_chain = "-" * 191
         print(line_chain)
-        print("| Round | Latency (s) | Training Latency (s) | Consensus Latency (s) | Other Latency (s) | Throughput (blocks/s) | Consensus Throughput (blocks/s) | Upload (MB) | Blocks | Forks |")
+        print("| Round | Latency (s) | Training Latency (s) | Consensus Latency (s) | Other Latency (s) | Throughput (blocks/s) | Consensus Throughput (blocks/s) | Upload (MB) | Blocks | Forks | ZKP Avg L2^2 | ZKP Max L2^2 | ZKP Rejected | ZK.Prove (s) | ZK.Verify (s) | Proof Size (KB) |")
         print(line_chain)
         for entry in chain_metrics:
             print(
@@ -92,6 +92,12 @@ def print_history_summary(history, total_rounds: int, num_clients: int, chain_me
                 f" {entry.get('consensus_throughput', float('nan')):32.2f} |"
                 f" {entry['upload_mb']:11.2f} |"
                 f" {entry['num_blocks']:6} | {entry['forks']:5} |"
+                f" {entry.get('zkp_l2_avg', float('nan')):13.2f} |"
+                f" {entry.get('zkp_l2_max', float('nan')):13.2f} |"
+                f" {entry.get('zkp_rejected', 0):13} |"
+                f" {entry.get('zkp_prove_avg', float('nan')):12.2f} |"
+                f" {entry.get('zkp_verify_avg', float('nan')):13.2f} |"
+                f" {entry.get('zkp_proof_kb', float('nan')):16.2f} |"
             )
         print(line_chain)
     print("| Round |    Loss    |  Mean IoU  | FG Pixel Acc |")
@@ -127,6 +133,53 @@ def parse_args():
         type=float,
         default=1.0,
         help="Fraction of clients sampled for training each round.",
+    )
+    parser.add_argument(
+        "--enable-zkp",
+        action="store_true",
+        help="Require clients to attach ZKP/certificates (scheme controlled by --zkp-scheme).",
+    )
+    parser.add_argument(
+        "--zkp-lib",
+        type=str,
+        default="fl-pnd/zkp/librofl_crypto.so",
+        help="Path to librofl_crypto.so (only used when --enable-zkp).",
+    )
+    parser.add_argument(
+        "--zkp-range-bits",
+        type=int,
+        default=16,
+        help="Bit-length bound for the RoFL L2 proof (symmetric range).",
+    )
+    parser.add_argument(
+        "--zkp-partitions",
+        type=int,
+        default=1,
+        help="Number of Pedersen partitions to use when constructing ZKP commitments.",
+    )
+    parser.add_argument(
+        "--zkp-scheme",
+        choices=["rofl", "fixed", "none"],
+        default="rofl",
+        help="Choose the ZKP backend: RoFL Bulletproofs, lightweight fixed-point, or none.",
+    )
+    parser.add_argument(
+        "--zkp-scale",
+        type=float,
+        default=1e4,
+        help="Fixed-point scale factor for the lightweight scheme.",
+    )
+    parser.add_argument(
+        "--zkp-clip",
+        type=float,
+        default=None,
+        help="Optional clipping bound applied before fixed-point encoding.",
+    )
+    parser.add_argument(
+        "--zkp-tau",
+        type=float,
+        default=10.0,
+        help="L2 bound (in float space) for the lightweight scheme.",
     )
     return parser.parse_args()
 
@@ -179,10 +232,35 @@ if __name__ == "__main__":
     class_weights = calculate_class_weights(full_train_dataset, num_classes)
 
     # 3. 准备客户端工厂函数 (client_fn)，注入所有资源
+    zkp_config = None
+    if args.enable_zkp:
+        scheme = args.zkp_scheme.lower()
+        zkp_config = {
+            "enabled": True,
+            "scheme": scheme,
+        }
+        if scheme == "rofl":
+            zkp_config.update(
+                {
+                    "lib_path": args.zkp_lib,
+                    "range_bits": max(1, args.zkp_range_bits),
+                    "n_partition": max(1, args.zkp_partitions),
+                }
+            )
+        elif scheme == "fixed":
+            zkp_config.update(
+                {
+                    "scale": args.zkp_scale,
+                    "clip": args.zkp_clip,
+                    "tau": args.zkp_tau,
+                }
+            )
+
     client_fn = client_fn_simulation(
         partitioner=partitioner, 
         valloader=valloader, 
-        class_weights=class_weights
+        class_weights=class_weights,
+        zkp_config=zkp_config,
     )
 
     # 4. 获取服务器组件 (Strategy 和 ServerConfig)
@@ -193,6 +271,7 @@ if __name__ == "__main__":
         eval_fraction=args.eval_fraction,
         fit_fraction=args.fit_fraction,
         local_epochs=args.local_epochs,
+        zkp_config=zkp_config,
     )
 
     # 5. 定义客户端所需的计算资源

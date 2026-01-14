@@ -18,9 +18,11 @@ class UpperChainBlock:
     training_time: float = 0.0
     train_finish_ts: float = 0.0
     broadcast_time: float = 0.0
+    delta_sha256: str = ""
     
     # --- 有默认值的字段 ---
     metrics: Dict[str, float] = field(default_factory=dict)
+    zkp: Dict[str, Any] = field(default_factory=dict)
     hash: str = ""
 
     def _get_hashable_string(self) -> str:
