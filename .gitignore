@@ -33,5 +33,10 @@ logs/
 build/
 dist/
 *.egg-info/
+target/
 doc/
 RoFL/
+.cargo
+.rustup/
+.tmp/
+.cargo-target/

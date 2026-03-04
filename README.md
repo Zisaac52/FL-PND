@@ -103,10 +103,11 @@ python run.py \
 - `--local-epochs`: local epochs per selected client (default `1`)
 - `--fit-fraction`: fraction of clients sampled for training (default `1.0`)
 - `--eval-fraction`: portion of clients sampled for evaluation (default `0.3`)
-- `--enable-zkp`: require each client update to carry a RoFL-style L2 zero-knowledge proof
-- `--zkp-range-bits`, `--zkp-partitions`, `--zkp-lib`: fine-tune the bound/checking parameters when proofs are enabled
-- `--zkp-scheme`: select `rofl` (Bulletproofs) or `fixed` (deterministic fixed-point certificate) for lighter experiments
-- `--zkp-scale`, `--zkp-clip`, `--zkp-tau`: configure the fixed-point encoder used by the lightweight scheme
+- `--enable-zkp`: require each client update to carry a zero-knowledge proof / certificate
+- `--zkp-range-bits`, `--zkp-partitions`, `--zkp-lib`: fine-tune the RoFL Bulletproof configuration
+- `--zkp-scheme`: select `rofl`, `fixed`, or `groth16` depending on the backend you want to benchmark
+- `--zkp-scale`, `--zkp-clip`, `--zkp-tau`: configure the shared fixed-point encoder used by the lightweight and Groth16 pipelines
+- `--groth16-bin`, `--groth16-pk`, `--groth16-vk`, `--groth16-diff-bits`: point to the Groth16 CLI binary, proving key, verifying key, and the integer gadget precision when running the SNARK-based scheme
 
 These flags flow directly into the custom Flower strategy, so both training and evaluation automatically obey the configuration you pass at runtime.
 
@@ -163,6 +164,29 @@ Run `python run.py --enable-zkp` to activate the RoFL proof pipeline. Each clien
 3. Attach the proof bundle plus the SHA-256 hash of the transmitted delta to the UpperChain block.
 
 The server verifies the proof and hash before accepting a block; invalid or missing proofs are automatically discarded. This keeps consensus latency low while guaranteeing every accepted Δw stays within the configured L2 bound.
+
+## Optional: Groth16 L2 Proofs
+
+For higher-assurance experiments, the repo also ships a standalone Rust crate (`zkp-groth16-l2/`) that builds Groth16 SNARKs over the BN254 curve. The CLI exposes `setup`, `witness`, `prove`, and `verify` subcommands which the Python side drives via `fl_pnd/zkp_groth16.py`.
+
+1. Build the CLI and keys once:
+   ```bash
+   cd zkp-groth16-l2
+   TMPDIR=../.tmp CARGO_HOME=../.cargo RUSTUP_TOOLCHAIN=stable cargo build --release
+   cargo run --bin zkp-groth16-l2 -- setup --len <delta_len> --pk pk.bin --vk vk.bin
+   ```
+2. Launch training with
+   ```bash
+   python run.py --enable-zkp --zkp-scheme groth16 \
+       --groth16-bin zkp-groth16-l2/target/release/zkp-groth16-l2 \
+       --groth16-pk zkp-groth16-l2/pk.bin \
+       --groth16-vk zkp-groth16-l2/vk.bin \
+       --groth16-diff-bits 32 \
+       --zkp-scale 1e4 --zkp-tau 2e15
+   ```
+   Clients flatten their FP32 deltas, call the CLI to create witnesses/proofs, and attach Base64 payloads plus `ZK.Prove` time and proof sizes to each `UpperChainBlock`. The server reuses the verifying key to confirm proofs, records `ZK.Verify` latency, and streams L2² statistics into the blockchain metrics table printed by `run.py`.
+
+More operational notes (witness layout, error messages, metric collection) reside in `doc/增加实验.md`.
 
 ## Future Work
 

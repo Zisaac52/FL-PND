@@ -159,14 +159,14 @@ def parse_args():
     )
     parser.add_argument(
         "--zkp-scheme",
-        choices=["rofl", "fixed", "none"],
+        choices=["rofl", "fixed", "groth16", "none"],
         default="rofl",
-        help="Choose the ZKP backend: RoFL Bulletproofs, lightweight fixed-point, or none.",
+        help="Choose the ZKP backend: RoFL Bulletproofs, lightweight fixed-point, Groth16, or none.",
     )
     parser.add_argument(
         "--zkp-scale",
         type=float,
-        default=1e4,
+        default=1e2,
         help="Fixed-point scale factor for the lightweight scheme.",
     )
     parser.add_argument(
@@ -180,6 +180,36 @@ def parse_args():
         type=float,
         default=10.0,
         help="L2 bound (in float space) for the lightweight scheme.",
+    )
+    parser.add_argument(
+        "--groth16-bin",
+        type=str,
+        default="zkp-groth16-l2/target/release/zkp-groth16-l2",
+        help="Path to the Groth16 CLI binary.",
+    )
+    parser.add_argument(
+        "--groth16-pk",
+        type=str,
+        default=None,
+        help="Path to the Groth16 proving key (required for clients).",
+    )
+    parser.add_argument(
+        "--groth16-vk",
+        type=str,
+        default=None,
+        help="Path to the Groth16 verifying key (required for the server).",
+    )
+    parser.add_argument(
+        "--groth16-diff-bits",
+        type=int,
+        default=128,
+        help="Bit-length for the integer difference gadget used in Groth16 witness generation.",
+    )
+    parser.add_argument(
+        "--groth16-layer-whitelist",
+        type=str,
+        default="doc/groth16_whitelist.json",
+        help="JSON file listing parameter name prefixes to include in Groth16 proofs.",
     )
     return parser.parse_args()
 
@@ -253,6 +283,19 @@ if __name__ == "__main__":
                     "scale": args.zkp_scale,
                     "clip": args.zkp_clip,
                     "tau": args.zkp_tau,
+                }
+            )
+        elif scheme == "groth16":
+            zkp_config.update(
+                {
+                    "scale": args.zkp_scale,
+                    "clip": args.zkp_clip,
+                    "tau": args.zkp_tau,
+                    "diff_bits": max(1, args.groth16_diff_bits),
+                    "groth16_bin": args.groth16_bin,
+                    "groth16_pk": args.groth16_pk,
+                    "groth16_vk": args.groth16_vk,
+                    "layer_whitelist_path": args.groth16_layer_whitelist,
                 }
             )
 

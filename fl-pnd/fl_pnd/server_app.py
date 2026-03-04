@@ -19,6 +19,8 @@ from .task import get_net
 from .data_structures import LowerChainBlock, UpperChainBlock
 from .serde import serializable_to_parameters
 from .zkp_fixed_l2 import verify_certificate as verify_fixed_l2
+from .zkp_groth16 import Groth16Engine, Groth16Error
+from .zkp_layers import flatten_selected_arrays, load_layer_whitelist
 from .zkp_bindings import (
     RoFLL2Engine,
     L2ProofArtifacts,
@@ -98,8 +100,11 @@ class LadderStrategy(fl.server.strategy.FedAvg):
         enabled_flag = bool(self.zkp_config.get("enabled", False))
         self.zkp_required = enabled_flag and self.zkp_scheme not in ("none", "")
         self._zkp_engine: Optional[RoFLL2Engine] = None
+        self._groth16_engine: Optional[Groth16Engine] = None
+        self.groth16_layer_prefixes, self.groth16_layer_meta = load_layer_whitelist(self.zkp_config)
 
         temp_net = get_net()
+        self.param_names = list(temp_net.state_dict().keys())
         initial_params = [val.cpu().numpy() for _, val in temp_net.state_dict().items()]
         self.latest_lower_block = LowerChainBlock(
             round=0,
@@ -345,6 +350,17 @@ class LadderStrategy(fl.server.strategy.FedAvg):
             self._zkp_engine = RoFLL2Engine(lib_path)
         return self._zkp_engine
 
+    def _get_groth16_engine(self) -> Optional[Groth16Engine]:
+        if not self.zkp_required or self.zkp_scheme != "groth16":
+            return None
+        if self._groth16_engine is None:
+            self._groth16_engine = Groth16Engine(
+                bin_path=self.zkp_config.get("groth16_bin"),
+                pk_path=self.zkp_config.get("groth16_pk"),
+                vk_path=self.zkp_config.get("groth16_vk"),
+            )
+        return self._groth16_engine
+
     def _verify_zkp_payload(
         self,
         zkp_payload: Optional[Dict[str, Any]],
@@ -400,6 +416,53 @@ class LadderStrategy(fl.server.strategy.FedAvg):
                 "verify_time": verify_time,
                 "prove_time": certificate.get("prove_time"),
                 "proof_bytes": certificate.get("proof_bytes"),
+            }
+        if scheme == "groth16":
+            proof_b64 = zkp_payload.get("proof_b64")
+            public_b64 = zkp_payload.get("public_b64")
+            if not proof_b64 or not public_b64:
+                print("    · Skipping block: Groth16 payload missing proof/public data.")
+                return False, None, None
+            if not self.groth16_layer_prefixes:
+                print("    · Skipping block: Groth16 layer whitelist is empty on server.")
+                return False, None, None
+            if zkp_payload.get("delta_hash") and declared_hash:
+                if zkp_payload["delta_hash"] != declared_hash:
+                    print("    · Skipping block: Groth16 delta hash mismatch.")
+                    return False, None, None
+            flat_vec, matched_names, _ = flatten_selected_arrays(
+                self.param_names,
+                delta_params,
+                self.groth16_layer_prefixes,
+            )
+            if flat_vec.size == 0:
+                print("    · Skipping block: Groth16 selection produced empty vector.")
+                return False, None, None
+            selection_hash_local = compute_payload_hash(flat_vec.tobytes())
+            selection_hash_claim = zkp_payload.get("selection_hash")
+            if selection_hash_claim and selection_hash_claim != selection_hash_local:
+                print("    · Skipping block: Groth16 selection hash mismatch.")
+                return False, None, None
+            selection_len_claim = zkp_payload.get("selection_len")
+            if selection_len_claim and int(selection_len_claim) != int(flat_vec.size):
+                print("    · Skipping block: Groth16 selection length mismatch.")
+                return False, None, None
+            try:
+                engine = self._get_groth16_engine()
+            except (Groth16Error, FileNotFoundError, OSError) as exc:
+                print(f"    · Skipping block: cannot init Groth16 engine ({exc}).")
+                return False, None, None
+            if not engine:
+                return False, None, None
+            try:
+                verify_time = engine.verify(proof_b64, public_b64)
+            except Groth16Error as exc:
+                print(f"    · Skipping block: Groth16 proof rejected ({exc}).")
+                return False, None, None
+            return True, zkp_payload.get("l2_sq"), {
+                "verify_time": verify_time,
+                "prove_time": zkp_payload.get("prove_time"),
+                "proof_bytes": zkp_payload.get("proof_bytes"),
             }
         print(f"    · Skipping block: unsupported ZKP scheme '{scheme}'.")
         return False, None, None

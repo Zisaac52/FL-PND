@@ -1,0 +1,15 @@
+[package]
+name = "zkp-groth16-l2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ark-groth16 = "0.4"
+ark-bn254 = "0.4"
+ark-ff = "0.4"
+ark-std = "0.4"
+ark-serialize = "0.4"
+ark-relations = "0.4"
+anyhow = "1"
+num-bigint = "0.4"
+num-traits = "0.2"

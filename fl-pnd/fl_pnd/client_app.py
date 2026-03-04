@@ -25,6 +25,8 @@ from .zkp_bindings import (
     ZKPBindingError,
 )
 from .zkp_fixed_l2 import build_certificate as build_fixed_l2_certificate
+from .zkp_groth16 import Groth16Engine, Groth16Error
+from .zkp_layers import flatten_selected_arrays, load_layer_whitelist
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -40,9 +42,11 @@ class FlowerClient(fl.client.NumPyClient):
     ):
         self.cid = cid
         self.net = get_net().to(DEVICE)
+        self.param_names = list(self.net.state_dict().keys())
         self.class_weights = class_weights
         self.zkp_config = zkp_config or {}
         self._zkp_engine: RoFLL2Engine | None = None
+        self._groth16_engine: Groth16Engine | None = None
         self.zkp_scheme = str(self.zkp_config.get("scheme", "none")).lower()
         enabled_flag = bool(self.zkp_config.get("enabled", False))
         self.zkp_enabled = enabled_flag and self.zkp_scheme not in ("none", "")
@@ -51,6 +55,11 @@ class FlowerClient(fl.client.NumPyClient):
         self.fixed_scale = float(self.zkp_config.get("scale", 1e4))
         self.fixed_clip = self.zkp_config.get("clip")
         self.fixed_tau = float(self.zkp_config.get("tau", 10.0))
+        self.groth16_diff_bits = int(self.zkp_config.get("diff_bits", 24))
+        self.groth16_bin = self.zkp_config.get("groth16_bin")
+        self.groth16_pk = self.zkp_config.get("groth16_pk")
+        self.groth16_vk = self.zkp_config.get("groth16_vk")
+        self.groth16_layer_prefixes, self.groth16_layer_meta = load_layer_whitelist(self.zkp_config)
         
         partition = partitioner.load_partition(int(cid))
         print(f"客户端 {self.cid} 已创建，加载了 {len(partition)} 个训练样本。")
@@ -147,6 +156,22 @@ class FlowerClient(fl.client.NumPyClient):
             self._zkp_engine = RoFLL2Engine(lib_path)
         return self._zkp_engine
 
+    def _get_groth16_engine(self) -> Groth16Engine | None:
+        if not self.zkp_enabled or self.zkp_scheme != "groth16":
+            return None
+        if self._groth16_engine is None:
+            self._groth16_engine = Groth16Engine(
+                bin_path=self.groth16_bin,
+                pk_path=self.groth16_pk,
+                vk_path=self.groth16_vk,
+            )
+        return self._groth16_engine
+
+    def _groth16_layer_selected(self, name: str) -> bool:
+        if not self.groth16_layer_prefixes:
+            return False
+        return any(name.startswith(prefix) for prefix in self.groth16_layer_prefixes)
+
     def _build_zkp_payload(self, delta_params_float32, delta_params_payload, serialized_bytes, delta_sha):
         if not self.zkp_enabled:
             return None
@@ -194,6 +219,44 @@ class FlowerClient(fl.client.NumPyClient):
             certificate["prove_time"] = prove_time
             certificate["proof_bytes"] = len(cert_bytes)
             return {"scheme": "fixed_l2", "certificate": certificate}
+        if self.zkp_scheme == "groth16":
+            if not self.groth16_layer_prefixes:
+                print(f"[ZKP] Client {self.cid}: groth16 layer whitelist is empty; skipping proof.")
+                return None
+            try:
+                engine = self._get_groth16_engine()
+            except (Groth16Error, FileNotFoundError, OSError) as exc:
+                print(f"[ZKP] Client {self.cid}: failed to init Groth16 engine ({exc})")
+                return None
+            if not engine:
+                return None
+            flat_vec, matched_names, selected_arrays = flatten_selected_arrays(
+                self.param_names,
+                delta_params_payload,
+                self.groth16_layer_prefixes,
+            )
+            if flat_vec.size == 0 or not selected_arrays:
+                print(f"[ZKP] Client {self.cid}: no parameters matched Groth16 whitelist; skipping proof.")
+                return None
+            selection_bytes = flat_vec.tobytes()
+            selection_hash = compute_payload_hash(selection_bytes)
+            try:
+                payload = engine.prove_delta(
+                    selected_arrays,
+                    scale=self.fixed_scale,
+                    tau=self.fixed_tau,
+                    clip=self.fixed_clip,
+                    diff_bits=self.groth16_diff_bits,
+                    delta_hash=delta_sha,
+                )
+            except Groth16Error as exc:
+                print(f"[ZKP] Client {self.cid}: Groth16 proof failed ({exc})")
+                return None
+            payload["selection_hash"] = selection_hash
+            payload["selection_len"] = int(flat_vec.size)
+            payload["selection_names"] = matched_names
+            payload["selection_prefixes"] = list(self.groth16_layer_prefixes)
+            return payload
         return None
 
 
