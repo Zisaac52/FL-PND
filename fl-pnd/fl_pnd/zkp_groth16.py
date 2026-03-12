@@ -9,12 +9,27 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-DEFAULT_BIN = (
+DEFAULT_BIN_CANDIDATES = (
+    Path(__file__).resolve().parents[2]
+    / "zkp-groth16-l2"
+    / "target"
+    / "release"
+    / "main",
+    Path(__file__).resolve().parents[2]
+    / "zkp-groth16-l2"
+    / "target"
+    / "release"
+    / "zkp-groth16-l2",
     Path(__file__).resolve().parents[1]
     / "zkp-groth16-l2"
     / "target"
     / "release"
+    / "main",
+    Path(__file__).resolve().parents[1]
     / "zkp-groth16-l2"
+    / "target"
+    / "release"
+    / "zkp-groth16-l2",
 )
 
 
@@ -23,7 +38,10 @@ class Groth16Error(RuntimeError):
 
 
 def _default_bin_path() -> Path:
-    return DEFAULT_BIN
+    for candidate in DEFAULT_BIN_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return DEFAULT_BIN_CANDIDATES[0]
 
 
 def _ensure_file(path: Path, kind: str) -> Path:

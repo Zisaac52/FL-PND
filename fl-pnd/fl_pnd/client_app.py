@@ -39,12 +39,26 @@ class FlowerClient(fl.client.NumPyClient):
         valloader,
         class_weights: torch.Tensor,
         zkp_config: dict | None = None,
+        malicious_config: dict | None = None,
     ):
         self.cid = cid
         self.net = get_net().to(DEVICE)
         self.param_names = list(self.net.state_dict().keys())
         self.class_weights = class_weights
         self.zkp_config = zkp_config or {}
+        malicious_cfg = malicious_config or {}
+        malicious_clients = {str(cid) for cid in malicious_cfg.get("clients", set())}
+        self.malicious_scale = float(malicious_cfg.get("scale", 50.0))
+        self.malicious_fraction = float(np.clip(malicious_cfg.get("fraction", 0.3), 0.0, 1.0))
+        self.malicious_alpha = float(malicious_cfg.get("alpha", 1.0))
+        self.malicious_clip = float(abs(malicious_cfg.get("clip", 1000.0)))
+        self.malicious_attack_prob = float(np.clip(malicious_cfg.get("attack_prob", 0.5), 0.0, 1.0))
+        self.malicious_mode = str(malicious_cfg.get("mode", "mask_noise")).lower()
+        self.full_noise_scale = float(malicious_cfg.get("noise_scale", 1.0))
+        raw_rounds = malicious_cfg.get("rounds", set())
+        self.malicious_rounds = {int(r) for r in raw_rounds} if raw_rounds else set()
+        self.is_malicious = self.cid in malicious_clients
+        self._last_attack_stats: dict | None = None
         self._zkp_engine: RoFLL2Engine | None = None
         self._groth16_engine: Groth16Engine | None = None
         self.zkp_scheme = str(self.zkp_config.get("scheme", "none")).lower()
@@ -60,6 +74,9 @@ class FlowerClient(fl.client.NumPyClient):
         self.groth16_pk = self.zkp_config.get("groth16_pk")
         self.groth16_vk = self.zkp_config.get("groth16_vk")
         self.groth16_layer_prefixes, self.groth16_layer_meta = load_layer_whitelist(self.zkp_config)
+        malicious_prefixes, _ = load_layer_whitelist(malicious_cfg)
+        # 攻击层优先使用恶意白名单；若未配置则回退到 ZKP 白名单；再为空则攻击全层。
+        self.attack_prefixes = list(malicious_prefixes or self.groth16_layer_prefixes)
         
         partition = partitioner.load_partition(int(cid))
         print(f"客户端 {self.cid} 已创建，加载了 {len(partition)} 个训练样本。")
@@ -99,6 +116,7 @@ class FlowerClient(fl.client.NumPyClient):
             updated.astype(np.float32) - base.astype(np.float32)
             for updated, base in zip(updated_params, initial_params)
         ]
+        delta_params = self._maybe_make_malicious(delta_params, current_round)
         delta_params_fp16 = [delta.astype(np.float16) for delta in delta_params]
         serialized_params_bytes = parameters_to_serializable(
             delta_params_fp16, dtype="float16"
@@ -129,6 +147,8 @@ class FlowerClient(fl.client.NumPyClient):
         )
         if zkp_payload:
             block_payload["zkp"] = zkp_payload
+        if self._last_attack_stats:
+            block_payload["simulated_attack"] = self._last_attack_stats
 
         block_payload_json = json.dumps(block_payload)
 
@@ -171,6 +191,98 @@ class FlowerClient(fl.client.NumPyClient):
         if not self.groth16_layer_prefixes:
             return False
         return any(name.startswith(prefix) for prefix in self.groth16_layer_prefixes)
+
+    def _maybe_make_malicious(self, delta_params: list[np.ndarray], current_round: int) -> list[np.ndarray]:
+        if not self.is_malicious:
+            self._last_attack_stats = None
+            return delta_params
+        rng = np.random.default_rng(seed=(int(time.time() * 1e6) ^ hash((self.cid, current_round))) & 0xFFFFFFFF)
+        if self.malicious_attack_prob <= 0.0 or rng.random() > self.malicious_attack_prob:
+            self._last_attack_stats = {
+                "is_malicious": True,
+                "attack": False,
+                "round": current_round,
+                "mode": self.malicious_mode,
+                "reason": "probability",
+            }
+            return delta_params
+        if self.malicious_rounds and current_round not in self.malicious_rounds:
+            self._last_attack_stats = {
+                "is_malicious": True,
+                "attack": False,
+                "round": current_round,
+                "mode": self.malicious_mode,
+                "reason": "round_filter",
+            }
+            return delta_params
+
+        if self.malicious_mode == "full_noise":
+            attacked = []
+            total_norm_sq = 0.0
+            for original in delta_params:
+                noise = rng.standard_normal(size=original.shape).astype(np.float32)
+                noise *= self.full_noise_scale
+                attacked.append(noise)
+                total_norm_sq += float(np.sum(noise ** 2))
+            self._last_attack_stats = {
+                "is_malicious": True,
+                "mode": "full_noise",
+                "attack": True,
+                "round": current_round,
+                "l2_sq": total_norm_sq,
+                "noise_scale": self.full_noise_scale,
+            }
+            print(
+                f"[AttackSim] Client {self.cid} round {current_round}: uploaded full Gaussian noise "
+                f"(||Δ||^2={total_norm_sq:.2e})."
+            )
+            return attacked
+
+        prefixes = self.attack_prefixes
+        attacked: list[np.ndarray] = []
+        total_norm_sq = 0.0
+        attacked_layers = 0
+        for name, original in zip(self.param_names, delta_params):
+            should_attack = not prefixes or any(name.startswith(prefix) for prefix in prefixes)
+            if should_attack:
+                noise = rng.standard_normal(size=original.shape).astype(np.float32)
+                if self.malicious_clip > 0:
+                    np.clip(noise, -self.malicious_clip, self.malicious_clip, out=noise)
+                mask = rng.random(size=original.shape) < self.malicious_fraction
+                perturb = self.malicious_alpha * self.malicious_scale * noise * mask
+                attacked_delta = original + perturb
+                attacked.append(attacked_delta)
+                total_norm_sq += float(np.sum((attacked_delta - original) ** 2))
+                attacked_layers += 1
+            else:
+                attacked.append(original)
+
+        if attacked_layers == 0:
+            self._last_attack_stats = {
+                "is_malicious": True,
+                "l2_sq": 0.0,
+                "scale": 0.0,
+                "note": "no prefixes matched",
+                "mode": "mask_noise",
+                "round": current_round,
+            }
+            return delta_params
+
+        self._last_attack_stats = {
+            "is_malicious": True,
+            "l2_sq": total_norm_sq,
+            "scale": self.malicious_scale,
+            "alpha": self.malicious_alpha,
+            "fraction": self.malicious_fraction,
+            "layers": attacked_layers,
+            "round": current_round,
+            "mode": "mask_noise",
+        }
+        print(
+            f"[AttackSim] Client {self.cid} round {current_round}: injected malicious delta "
+            f"(layers={attacked_layers}, ||Δ||^2={total_norm_sq:.2e})."
+        )
+        return attacked
 
     def _build_zkp_payload(self, delta_params_float32, delta_params_payload, serialized_bytes, delta_sha):
         if not self.zkp_enabled:
@@ -260,8 +372,22 @@ class FlowerClient(fl.client.NumPyClient):
         return None
 
 
-def client_fn_simulation(partitioner, valloader, class_weights: torch.Tensor, zkp_config: dict | None = None):
+def client_fn_simulation(
+    partitioner,
+    valloader,
+    class_weights: torch.Tensor,
+    zkp_config: dict | None = None,
+    malicious_config: dict | None = None,
+):
     def client_fn(context: Context) -> fl.client.Client:
         cid = str(context.node_config.get("partition-id", context.node_id))
-        return FlowerClient(cid, partitioner, valloader, class_weights, zkp_config=zkp_config).to_client()
+        return FlowerClient(
+            cid,
+            partitioner,
+            valloader,
+            class_weights,
+            zkp_config=zkp_config,
+            malicious_config=malicious_config,
+        ).to_client()
+
     return client_fn

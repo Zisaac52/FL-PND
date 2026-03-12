@@ -4,6 +4,7 @@ This script provides full control over the Ray initialization and
 federated learning setup, bypassing `flwr run`.
 """
 import argparse
+from pathlib import Path
 
 import flwr as fl
 import ray
@@ -100,6 +101,8 @@ def print_history_summary(history, total_rounds: int, num_clients: int, chain_me
                 f" {entry.get('zkp_proof_kb', float('nan')):16.2f} |"
             )
         print(line_chain)
+    elif chain_metrics is not None:
+        print("\n区块链性能指标: 无有效区块（可能因缺少/无效 ZKP 被跳过，已回退到 FedAvg）。")
     print("| Round |    Loss    |  Mean IoU  | FG Pixel Acc |")
     print(line)
     for rnd in rounds:
@@ -184,7 +187,7 @@ def parse_args():
     parser.add_argument(
         "--groth16-bin",
         type=str,
-        default="zkp-groth16-l2/target/release/zkp-groth16-l2",
+        default="zkp-groth16-l2/target/release/main",
         help="Path to the Groth16 CLI binary.",
     )
     parser.add_argument(
@@ -200,9 +203,70 @@ def parse_args():
         help="Path to the Groth16 verifying key (required for the server).",
     )
     parser.add_argument(
+        "--malicious-clients",
+        type=str,
+        default="",
+        help="Comma-separated client ids to simulate as malicious (e.g. 1,4).",
+    )
+    parser.add_argument(
+        "--malicious-scale",
+        type=float,
+        default=50.0,
+        help="Std-dev multiplier for malicious noise (larger => stronger attack).",
+    )
+    parser.add_argument(
+        "--malicious-fraction",
+        type=float,
+        default=0.3,
+        help="Portion of parameters (0-1) within targeted layers to perturb.",
+    )
+    parser.add_argument(
+        "--malicious-alpha",
+        type=float,
+        default=1.0,
+        help="Strength of perturbation mixed with original delta (0 keeps original).",
+    )
+    parser.add_argument(
+        "--malicious-clip",
+        type=float,
+        default=1000.0,
+        help="Clip bound applied to generated malicious noise (abs value).",
+    )
+    parser.add_argument(
+        "--malicious-attack-prob",
+        type=float,
+        default=0.5,
+        help="Probability (0-1) that a malicious client attacks in a given round.",
+    )
+    parser.add_argument(
+        "--malicious-mode",
+        type=str,
+        choices=["mask_noise", "full_noise"],
+        default="mask_noise",
+        help="Attack mode: partial mask noise or full random delta replacement.",
+    )
+    parser.add_argument(
+        "--malicious-noise-scale",
+        type=float,
+        default=1.0,
+        help="Std-dev of Gaussian noise when using full_noise mode.",
+    )
+    parser.add_argument(
+        "--malicious-layer-whitelist",
+        type=str,
+        default="",
+        help="Optional JSON whitelist for malicious attack layers (same format as Groth16 whitelist).",
+    )
+    parser.add_argument(
+        "--malicious-rounds",
+        type=str,
+        default="",
+        help="Optional comma-separated rounds where malicious attacks are allowed (e.g. 5,10,20).",
+    )
+    parser.add_argument(
         "--groth16-diff-bits",
         type=int,
-        default=128,
+        default=256,
         help="Bit-length for the integer difference gadget used in Groth16 witness generation.",
     )
     parser.add_argument(
@@ -211,7 +275,43 @@ def parse_args():
         default="doc/groth16_whitelist.json",
         help="JSON file listing parameter name prefixes to include in Groth16 proofs.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.enable_zkp and args.zkp_scheme.lower() == "groth16":
+        # The current Groth16 `prove` path is hard-wired to DEFAULT_DIFF_BITS in Rust.
+        # Keep CLI aligned to avoid witness/prove circuit mismatch.
+        if args.groth16_diff_bits != 256:
+            parser.error(
+                "--groth16-diff-bits must be 256 for the current Groth16 binary "
+                "(otherwise proof generation fails with AssignmentMissing)."
+            )
+
+        bin_path = Path(args.groth16_bin)
+        if not bin_path.exists():
+            fallback_bin = Path("zkp-groth16-l2/target/release/main")
+            if bin_path.name == "zkp-groth16-l2" and fallback_bin.exists():
+                print(
+                    f"[Config] Groth16 binary not found at {bin_path}, "
+                    f"falling back to {fallback_bin}."
+                )
+                args.groth16_bin = str(fallback_bin)
+            else:
+                parser.error(
+                    f"--groth16-bin not found: {bin_path}. "
+                    "Build the binary first or pass the correct path."
+                )
+
+        if not args.groth16_pk:
+            parser.error("--groth16-pk is required when --enable-zkp and --zkp-scheme groth16.")
+        if not Path(args.groth16_pk).exists():
+            parser.error(f"--groth16-pk not found: {args.groth16_pk}")
+
+        if not args.groth16_vk:
+            parser.error("--groth16-vk is required when --enable-zkp and --zkp-scheme groth16.")
+        if not Path(args.groth16_vk).exists():
+            parser.error(f"--groth16-vk not found: {args.groth16_vk}")
+
+    return args
 
 
 @ray.remote(num_cpus=1)
@@ -299,11 +399,32 @@ if __name__ == "__main__":
                 }
             )
 
+    malicious_clients = {cid.strip() for cid in args.malicious_clients.split(",") if cid.strip()}
+    malicious_rounds = {
+        int(r.strip())
+        for r in args.malicious_rounds.split(",")
+        if r.strip()
+    }
+    malicious_config = {
+        "clients": malicious_clients,
+        "scale": float(args.malicious_scale),
+        "fraction": float(args.malicious_fraction),
+        "alpha": float(args.malicious_alpha),
+        "clip": float(args.malicious_clip),
+        "attack_prob": float(args.malicious_attack_prob),
+        "mode": args.malicious_mode,
+        "noise_scale": float(args.malicious_noise_scale),
+        "rounds": malicious_rounds,
+    }
+    if args.malicious_layer_whitelist:
+        malicious_config["layer_whitelist_path"] = args.malicious_layer_whitelist
+
     client_fn = client_fn_simulation(
-        partitioner=partitioner, 
-        valloader=valloader, 
+        partitioner=partitioner,
+        valloader=valloader,
         class_weights=class_weights,
         zkp_config=zkp_config,
+        malicious_config=malicious_config,
     )
 
     # 4. 获取服务器组件 (Strategy 和 ServerConfig)
